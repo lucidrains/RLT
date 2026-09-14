@@ -297,15 +297,10 @@ class AttentionResidual(Module):
 
     def forward(
         self,
-        block_outputs: list[Tensor] | Tensor,
-        keys_values: list[Tensor] | None = None
+        block_outputs: list[Tensor] | Tensor
     ):
-        if exists(keys_values):
-            curr_tokens = block_outputs
-            block_outputs = list(keys_values)
-        else:
-            block_outputs = list(block_outputs)
-            curr_tokens = block_outputs[-1]
+        block_outputs = list(block_outputs)
+        curr_tokens = block_outputs[-1]
 
         past_layers = rearrange(block_outputs, 'l b n d -> b n l d')
 
