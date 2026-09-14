@@ -262,7 +262,6 @@ class Transformer(Module):
         ff_expansion_factor = 4,
         rotary_embed = True,
         dim_rotary = None,
-        final_norm = True,
         use_flex_attn = False
     ):
         super().__init__()
@@ -288,8 +287,6 @@ class Transformer(Module):
             layers.append(ModuleList([self_attn, cross_attn, ff]))
 
         self.layers = layers
-
-        self.norm = RMSNorm(dim) if final_norm else Identity()
 
     def forward(
         self,
@@ -325,12 +322,8 @@ class Transformer(Module):
 
             tokens = ff(tokens) + tokens
 
-        # norm
-
-        out = self.norm(tokens)
-
         if not return_memories:
-            return out
+            return tokens
 
         # maybe take care of sliding window size - since always doing one token at a time, just do like inference where one slices off the earlier end
 
@@ -340,7 +333,7 @@ class Transformer(Module):
 
         next_step = step + seq_len
 
-        return out, TransformerMemories(next_step, next_memories)
+        return tokens, TransformerMemories(next_step, next_memories)
 
 # the recurrent transition they propose
 
@@ -415,7 +408,11 @@ class RLT(Module):
 
         # YOCO - Sun et al.
 
-        self.encoded_to_keys_values = LinearNoBias(dim, dim_inner * 2)
+        self.to_encoded_key_values = Sequential(
+            RMSNorm(dim),
+            LinearNoBias(dim, dim_inner * 2)
+        )
+
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
 
         # recurrence related
@@ -435,7 +432,10 @@ class RLT(Module):
 
         # to logits
 
-        self.to_logits = LinearNoBias(dim, num_tokens) if has_num_tokens else None
+        self.to_logits = Sequential(
+            RMSNorm(dim),
+            LinearNoBias(dim, num_tokens)
+        ) if has_num_tokens else None
 
     @property
     def device(self):
@@ -540,7 +540,7 @@ class RLT(Module):
 
         # keys and values for cross attention
 
-        keys, values = self.encoded_to_keys_values(encoded).chunk(2, dim = -1)
+        keys, values = self.to_encoded_key_values(encoded).chunk(2, dim = -1)
         keys, values = (self.split_heads(t) for t in (keys, values))
 
         prev_num_tokens = 0
