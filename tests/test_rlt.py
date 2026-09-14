@@ -28,7 +28,8 @@ def test_rlt(
         dec_depth = 2,
         num_tokens = num_tokens,
         dec_sliding_window_size = window_size,
-        use_flex_attn = use_flex_attn
+        use_flex_attn = use_flex_attn,
+        tbptt_step_size = 2
     )
 
     if exists(num_tokens):
@@ -45,6 +46,10 @@ def test_rlt(
         assert out.shape == expected_shape
 
     out.sum().backward()
+
+    if exists(num_tokens):
+        sampled = model.generate(tokens, max_len = seq_len + 5)
+        assert sampled.shape == (2, 5)
 
 @param('use_flex_attn', (False, True))
 @param('num_tokens', (None, 256))

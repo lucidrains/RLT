@@ -1,6 +1,6 @@
 [project]
 name = "RLT-pytorch"
-version = "0.0.8"
+version = "0.0.9"
 description = "Recurrent Looped Transformer - Pytorch"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

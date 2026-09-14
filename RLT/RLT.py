@@ -1,16 +1,18 @@
 from __future__ import annotations
 from collections import namedtuple
 from functools import partial
+from math import ceil
+from typing import Callable
 
 import torch
-from torch import nn, cat
+from torch import nn, cat, Tensor
 from torch.nn import Module, ModuleList, Linear, Identity, Sequential, RMSNorm
 import torch.nn.functional as F
 
 from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
 
-from torch_einops_utils import tree_map_tensor
+from torch_einops_utils import tree_map_tensor, temp_eval, pack_with_inverse, tree_map_detach
 from rotary_embedding_torch import RotaryEmbedding
 
 # types
@@ -32,8 +34,45 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def identity(t, *args, **kwargs):
+    return t
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
+
+# sampling helpers
+
+def log(t, eps = 1e-20):
+    return torch.log(t.clamp(min = eps))
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(t, temperature = 1., dim = -1, eps = 1e-10):
+    if temperature == 0.:
+        return t.argmax(dim = dim)
+
+    return ((t / max(temperature, eps)) + gumbel_noise(t)).argmax(dim = dim)
+
+# topk
+
+def top_k(logits, frac_num_tokens = 0.1, k: int | None = None, thres: float | None = None):
+    num_tokens = logits.shape[-1]
+
+    if exists(thres):
+        frac_num_tokens = 1. - thres
+
+    k = default(k, ceil(frac_num_tokens * num_tokens))
+    k = min(max(k, 1), num_tokens)
+
+    val, ind = torch.topk(logits, k)
+    probs = torch.full_like(logits, float('-inf'))
+    probs.scatter_(-1, ind, val)
+    return probs
 
 # maybe flex attention
 
@@ -332,26 +371,33 @@ class RLT(Module):
         rotary_embed = True,
         dim_rotary = None,
         recurrent_transition: Module | None = None,
-        use_flex_attn = False
+        use_flex_attn = False,
+        tbptt_step_size: int | None = None
     ):
         super().__init__()
-        assert not exists(dec_sliding_window_size) or dec_sliding_window_size >= 1
-        assert not exists(dim_rotary) or dim_rotary <= dim_head
+        has_num_tokens = exists(num_tokens)
+        self.has_num_tokens = has_num_tokens
 
-        self.token_emb = nn.Embedding(num_tokens, dim) if exists(num_tokens) else None
+        self.token_emb = nn.Embedding(num_tokens, dim) if has_num_tokens else None
 
         dim_inner = dim_head * heads
 
+        # transformer settings
+
+        transformer_kwargs = dict(heads = heads, dim_head = dim_head, ff_expansion_factor = ff_expansion_factor, rotary_embed = rotary_embed, dim_rotary = dim_rotary, use_flex_attn = use_flex_attn)
+
         # encoder
 
-        self.encoder = Transformer(dim, depth = enc_depth, dim_head = dim_head, heads = heads, rotary_embed = rotary_embed, dim_rotary = dim_rotary, use_flex_attn = use_flex_attn)
+        self.encoder = Transformer(dim, depth = enc_depth, **transformer_kwargs)
 
         # YOCO - Sun et al.
 
         self.encoded_to_keys_values = LinearNoBias(dim, dim_inner * 2)
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
 
-        # initial recurrent state (wip)
+        # recurrence related
+
+        self.tbptt_step_size = tbptt_step_size
 
         self.initial_state = nn.Parameter(torch.randn(dim) * 1e-2)
 
@@ -362,21 +408,90 @@ class RLT(Module):
 
         # decoder
 
-        self.decoder = Transformer(dim, depth = dec_depth, dim_head = dim_head, heads = heads, cross_attn = True, self_attn_window_size = dec_sliding_window_size, rotary_embed = rotary_embed, dim_rotary = dim_rotary, use_flex_attn = use_flex_attn)
+        self.decoder = Transformer(dim, depth = dec_depth, cross_attn = True, self_attn_window_size = dec_sliding_window_size, **transformer_kwargs)
 
         # to logits
 
-        self.to_logits = LinearNoBias(dim, num_tokens) if exists(num_tokens) else None
+        self.to_logits = LinearNoBias(dim, num_tokens) if has_num_tokens else None
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    # generate
+
+    @temp_eval
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: Tensor,
+        seq_len: int | None = None,
+        max_len: int | None = None,
+        temperature: float = 1.,
+        filter_fn: Callable = top_k,
+        filter_kwargs: dict = dict(frac_num_tokens = 0.1)
+    ):
+        assert self.has_num_tokens, '`num_tokens` must be passed to RLT to generate'
+
+        max_len = default(max_len, seq_len)
+        assert exists(max_len), 'max_len must be supplied'
+
+        filter_fn = default(filter_fn, identity)
+        filter_kwargs = default(filter_kwargs, {})
+
+        # handle maybe 1d prompt
+
+        prompt, inverse_pack = pack_with_inverse(prompt, '* n')
+
+        prompt = prompt.to(self.device)
+
+        sample_num_times = max(0, max_len - prompt.shape[-1])
+
+        if sample_num_times == 0:
+            return inverse_pack(prompt[:, :0])
+
+        out = []
+
+        # catch up memories with prompt
+
+        step_out, memories = self(prompt)
+
+        # sample first token
+
+        logits = step_out[:, -1]
+        filtered_logits = filter_fn(logits, **filter_kwargs)
+        sampled = gumbel_sample(filtered_logits, temperature = temperature)
+        sampled = rearrange(sampled, 'b -> b 1')
+
+        out.append(sampled)
+
+        # generate remaining tokens step-by-step with recurrent state
+
+        for _ in range(sample_num_times - 1):
+            step_out, memories = self(sampled, memories = memories)
+
+            logits = step_out[:, -1]
+            filtered_logits = filter_fn(logits, **filter_kwargs)
+            sampled = gumbel_sample(filtered_logits, temperature = temperature)
+            sampled = rearrange(sampled, 'b -> b 1')
+
+            out.append(sampled)
+
+        # concat all newly generated tokens
+
+        out = cat(out, dim = -1)
+
+        return inverse_pack(out)
 
     def forward(
         self,
         tokens,
         memories: RLTMemories | None = None,
-        return_loss = False
+        return_loss = False,
     ):
         # embed
 
-        if exists(self.token_emb):
+        if self.has_num_tokens:
 
             if return_loss:
                 tokens, labels = tokens[:, :-1], tokens[:, 1:]
@@ -444,6 +559,11 @@ class RLT(Module):
 
             state = decoder_output
 
+            # truncated bptt
+
+            if exists(self.tbptt_step_size) and divisible_by(total_index, self.tbptt_step_size):
+                state, dec_memories = tree_map_detach((state, dec_memories))
+
         decoded = cat(decoder_outputs, dim = 1)
 
         memories = RLTMemories(
@@ -451,7 +571,7 @@ class RLT(Module):
             DecoderMemories(state, dec_memories)
         )
 
-        if not exists(self.to_logits):
+        if not self.has_num_tokens:
             assert not return_loss
             return decoded, memories
 

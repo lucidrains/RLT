@@ -6,6 +6,49 @@ Unofficial implementation of the [Recurrent Looped Transformer](https://yifanzha
 
 Will also do some exploration of the [Recurrent Transformer](https://arxiv.org/abs/2604.21215) proposed by Costin-Andrei Oncescu et al. of Harvard, if I have any remaining time
 
+## Install
+
+```bash
+$ pip install rlt-pytorch
+```
+
+## Usage
+
+```python
+import torch
+from RLT import RLT
+
+model = RLT(
+    num_tokens = 256,
+    dim = 512,
+    enc_depth = 4,
+    dec_depth = 4,
+    dec_sliding_window_size = 16,
+    tbptt_step_size = 16 # optional truncated bptt
+)
+
+tokens = torch.randint(0, 256, (2, 1024))
+
+# forward for loss
+
+loss = model(tokens, return_loss = True)
+loss.backward()
+
+# generate
+
+prompt = torch.randint(0, 256, (2, 32))
+
+sampled = model.generate(prompt, max_len = 128) # (2, 96)
+```
+
+## Test
+
+Train on enwik8
+
+```bash
+$ uv run train_enwik8.py
+```
+
 ## Citations
 
 ```bibtex
