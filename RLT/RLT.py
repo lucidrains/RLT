@@ -5,8 +5,8 @@ from math import ceil
 from typing import Callable
 
 import torch
-from torch import nn, cat, Tensor
-from torch.nn import Module, ModuleList, Linear, Identity, Sequential, RMSNorm
+from torch import nn, cat, Tensor, is_tensor
+from torch.nn import Module, ModuleList, Linear, Identity, Sequential, RMSNorm, Parameter
 import torch.nn.functional as F
 
 from einops import einsum, rearrange, repeat
@@ -113,6 +113,36 @@ def flex_attention(
         block_mask = create_block_mask(mask_mod, B = None, H = None, Q_LEN = rows, KV_LEN = cols, device = q.device)
 
     return pt_flex_attention(q, k, v, block_mask = block_mask, scale = scale)
+
+# lora linear
+
+class LoRALinear(Module):
+    def __new__(
+        cls,
+        dim_in,
+        dim_out = None,
+        rank = None
+    ):
+        dim_out = default(dim_out, dim_in)
+
+        if not exists(rank):
+            return LinearNoBias(dim_in, dim_out)
+
+        return super().__new__(cls)
+
+    def __init__(
+        self,
+        dim_in,
+        dim_out = None,
+        rank = None
+    ):
+        super().__init__()
+        dim_out = default(dim_out, dim_in)
+        self.down = LinearNoBias(dim_in, rank)
+        self.up = LinearNoBias(rank, dim_out)
+
+    def forward(self, x):
+        return self.up(self.down(x))
 
 # attention
 
@@ -246,6 +276,51 @@ def Feedforward(
         Linear(dim_inner, dim)
     )
 
+# attention residual
+# Guangyu (Nathan) Chen et al. with Kimi team https://arxiv.org/abs/2603.15031
+
+class AttentionResidual(Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        query_key_rank: int | None = None
+    ):
+        super().__init__()
+        self.scale = dim ** -0.5
+
+        self.to_queries = LoRALinear(dim, rank = query_key_rank)
+        self.to_keys = LoRALinear(dim, rank = query_key_rank)
+
+        self.query_rmsnorm = RMSNorm(dim)
+        self.key_rmsnorm = RMSNorm(dim)
+
+    def forward(
+        self,
+        block_outputs: list[Tensor] | Tensor,
+        keys_values: list[Tensor] | None = None
+    ):
+        if exists(keys_values):
+            curr_tokens = block_outputs
+            block_outputs = list(keys_values)
+        else:
+            block_outputs = list(block_outputs)
+            curr_tokens = block_outputs[-1]
+
+        past_layers = rearrange(block_outputs, 'l b n d -> b n l d')
+
+        queries = self.to_queries(curr_tokens)
+        keys = self.to_keys(past_layers)
+
+        queries = self.query_rmsnorm(queries)
+        keys = self.key_rmsnorm(keys)
+
+        sim = einsum(queries, keys, 'b n d, b n l d -> b n l') * self.scale
+
+        attn = sim.softmax(dim = -1)
+
+        return einsum(attn, past_layers, 'b n l, b n l d -> b n d')
+
 # transformer
 
 class Transformer(Module):
@@ -262,7 +337,9 @@ class Transformer(Module):
         ff_expansion_factor = 4,
         rotary_embed = True,
         dim_rotary = None,
-        use_flex_attn = False
+        use_flex_attn = False,
+        attn_residual = False,
+        attn_residual_query_key_rank: int | None = None
     ):
         super().__init__()
         assert not exists(self_attn_window_size) or self_attn_window_size >= 1
@@ -278,13 +355,15 @@ class Transformer(Module):
         layers = ModuleList([])
 
         for _ in range(depth):
-            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, rotary_embed = self.rotary_embed, sliding_window_size = self.self_attn_window_size, use_flex_attn = use_flex_attn) if self_attn else None
+            self_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, rotary_embed = self.rotary_embed, sliding_window_size = self.self_attn_window_size, use_flex_attn = use_flex_attn) if self_attn else None
 
-            cross_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend_key_values = True, use_flex_attn = use_flex_attn) if cross_attn else None
+            cross_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend_key_values = True, use_flex_attn = use_flex_attn) if cross_attn else None
 
             ff = Feedforward(dim = dim, expansion_factor = ff_expansion_factor)
 
-            layers.append(ModuleList([self_attn, cross_attn, ff]))
+            attn_res = AttentionResidual(dim, query_key_rank = attn_residual_query_key_rank) if attn_residual else None
+
+            layers.append(ModuleList([self_attn_module, cross_attn_module, ff, attn_res]))
 
         self.layers = layers
 
@@ -293,7 +372,8 @@ class Transformer(Module):
         tokens,
         keys_values = None,
         memories = None,
-        return_memories = False
+        return_memories = False,
+        block_outputs: list[Tensor] | None = None
     ):
         seq_len = tokens.shape[-2]
 
@@ -301,9 +381,14 @@ class Transformer(Module):
         iter_memories = iter(memories)
         next_memories = []
 
+        if exists(block_outputs):
+            block_outputs = [block_outputs] if is_tensor(block_outputs) else list(block_outputs)
+        else:
+            block_outputs = [tokens]
+
         # layers
 
-        for self_attn, cross_attn, ff in self.layers:
+        for self_attn, cross_attn, ff, attn_residual in self.layers:
 
             # self attention
 
@@ -321,6 +406,12 @@ class Transformer(Module):
             # feedforward
 
             tokens = ff(tokens) + tokens
+
+            # attention residual
+
+            if exists(attn_residual):
+                block_outputs.append(tokens)
+                tokens = attn_residual(block_outputs)
 
         if not return_memories:
             return tokens
@@ -385,7 +476,9 @@ class RLT(Module):
         dim_rotary = None,
         recurrent_transition: Module | None = None,
         use_flex_attn = False,
-        tbptt_step_size: int | None = None
+        tbptt_step_size: int | None = None,
+        attn_residual = False,
+        attn_residual_query_key_rank: int | None = None
     ):
         super().__init__()
         has_num_tokens = exists(num_tokens)
@@ -400,7 +493,16 @@ class RLT(Module):
 
         # transformer settings
 
-        transformer_kwargs = dict(heads = heads, dim_head = dim_head, ff_expansion_factor = ff_expansion_factor, rotary_embed = rotary_embed, dim_rotary = dim_rotary, use_flex_attn = use_flex_attn)
+        transformer_kwargs = dict(
+            heads = heads,
+            dim_head = dim_head,
+            ff_expansion_factor = ff_expansion_factor,
+            rotary_embed = rotary_embed,
+            dim_rotary = dim_rotary,
+            use_flex_attn = use_flex_attn,
+            attn_residual = attn_residual,
+            attn_residual_query_key_rank = attn_residual_query_key_rank
+        )
 
         # encoder
 

@@ -3,4 +3,6 @@ from RLT.RLT import (
     Transformer,
     Attention,
     Feedforward,
+    LoRALinear,
+    AttentionResidual,
 )
