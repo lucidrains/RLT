@@ -10,6 +10,7 @@ from einops import einsum, repeat
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import tree_map_tensor
+from rotary_embedding_torch import RotaryEmbedding
 
 # constants
 
@@ -35,12 +36,13 @@ class Attention(Module):
         dim_head = 64,
         heads = 8,
         causal = True,
-        cross_attend_key_values = False
+        cross_attend_key_values = False,
+        rotary_embed: RotaryEmbedding | None = None
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
-        self.causal = causal
+        self.causal = causal and not cross_attend_key_values
 
         self.norm = RMSNorm(dim)
 
@@ -52,11 +54,14 @@ class Attention(Module):
 
         self.to_out = LinearNoBias(dim_inner, dim)
 
+        self.rotary_embed = rotary_embed
+
     def forward(
         self,
         tokens,
         keys_values = None,
         memories = None,
+        offset = 0,
         return_memories = False
     ):
 
@@ -74,6 +79,12 @@ class Attention(Module):
             k, v = keys_values
 
         q = self.split_heads(q)
+
+        # rotary embedding
+
+        if exists(self.rotary_embed):
+            q = self.rotary_embed.rotate_queries_or_keys(q, offset = offset)
+            k = self.rotary_embed.rotate_queries_or_keys(k, offset = offset)
 
         if exists(memories):
             mk, mv = memories
@@ -98,7 +109,7 @@ class Attention(Module):
         if not return_memories:
             return out
 
-        return out, (k, v)
+        return out, [k, v]
 
 # feedforward
 
@@ -136,17 +147,25 @@ class Transformer(Module):
         cross_attn = False,
         self_attn_window_size = None,
         ff_expansion_factor = 4,
+        rotary_embed = True,
+        dim_rotary = None,
         final_norm = True
     ):
         super().__init__()
         assert not exists(self_attn_window_size) or self_attn_window_size >= 1
+        assert not exists(dim_rotary) or dim_rotary <= dim_head
 
         self.self_attn_window_size = self_attn_window_size
+
+        # rotary embedding
+
+        dim_rotary = default(dim_rotary, dim_head)
+        self.rotary_embed = RotaryEmbedding(dim_rotary) if rotary_embed else None
 
         layers = ModuleList([])
 
         for _ in range(depth):
-            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads) if self_attn else None
+            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, rotary_embed = self.rotary_embed) if self_attn else None
 
             cross_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend_key_values = True) if cross_attn else None
 
@@ -165,8 +184,10 @@ class Transformer(Module):
         memories = None,
         return_memories = False
     ):
+        seq_len = tokens.shape[-2]
 
-        iter_memories = iter(default(memories, []))
+        step, memories = default(memories, (0, []))
+        iter_memories = iter(memories)
         next_memories = []
 
         # layers
@@ -176,7 +197,7 @@ class Transformer(Module):
             # self attention
 
             if exists(self_attn):
-                self_attn_out, next_memory = self_attn(tokens, memories = next(iter_memories, None), return_memories = True)
+                self_attn_out, next_memory = self_attn(tokens, memories = next(iter_memories, None), offset = step, return_memories = True)
                 tokens = self_attn_out + tokens
 
                 next_memories.append(next_memory)
@@ -203,7 +224,9 @@ class Transformer(Module):
             w = self.self_attn_window_size
             next_memories = tree_map_tensor(lambda t: t[..., -(w - 1):, :] if w > 1 else t[..., :0, :], next_memories)
 
-        return out, next_memories
+        next_step = step + seq_len
+
+        return out, (next_step, next_memories)
 
 # the recurrent transition they propose
 
@@ -243,20 +266,26 @@ class RLT(Module):
         *,
         enc_depth,
         dec_depth,
+        num_tokens = None,
         dim_head = 64,
         heads = 8,
         ff_expansion_factor = 4.,
         recurrent_transition_alpha = 1.,
         dec_sliding_window_size = 16,
+        rotary_embed = True,
+        dim_rotary = None,
     ):
         super().__init__()
         assert not exists(dec_sliding_window_size) or dec_sliding_window_size >= 1
+        assert not exists(dim_rotary) or dim_rotary <= dim_head
+
+        self.token_emb = nn.Embedding(num_tokens, dim) if exists(num_tokens) else None
 
         dim_inner = dim_head * heads
 
         # encoder
 
-        self.encoder = Transformer(dim, depth = enc_depth, dim_head = dim_head, heads = heads)
+        self.encoder = Transformer(dim, depth = enc_depth, dim_head = dim_head, heads = heads, rotary_embed = rotary_embed, dim_rotary = dim_rotary)
 
         # YOCO - Sun et al.
 
@@ -271,12 +300,18 @@ class RLT(Module):
 
         # decoder
 
-        self.decoder = Transformer(dim, depth = dec_depth, dim_head = dim_head, heads = heads, cross_attn = True, self_attn_window_size = dec_sliding_window_size)
+        self.decoder = Transformer(dim, depth = dec_depth, dim_head = dim_head, heads = heads, cross_attn = True, self_attn_window_size = dec_sliding_window_size, rotary_embed = rotary_embed, dim_rotary = dim_rotary)
+
+        # to logits
+
+        self.to_logits = LinearNoBias(dim, num_tokens) if exists(num_tokens) else None
 
     def forward(
         self,
         tokens
     ):
+        if exists(self.token_emb):
+            tokens = self.token_emb(tokens)
 
         encoded = self.encoder(tokens)
 
@@ -320,4 +355,7 @@ class RLT(Module):
 
         decoded = cat(decoder_outputs, dim = 1)
 
-        return decoded
+        if not exists(self.to_logits):
+            return decoded
+
+        return self.to_logits(decoded)
