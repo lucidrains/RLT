@@ -35,6 +35,40 @@ def default(v, d):
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
 
+# maybe flex attention
+
+try:
+    from torch.nn.attention.flex_attention import flex_attention as pt_flex_attention, create_block_mask
+
+    if torch.cuda.is_available():
+        pt_flex_attention = torch.compile(pt_flex_attention)
+
+except ImportError:
+    pt_flex_attention = None
+    create_block_mask = None
+
+def flex_attention(
+    q, k, v,
+    causal = False,
+    scale = None
+):
+    assert exists(pt_flex_attention), 'flex_attention requires torch >= 2.5.0'
+
+    rows, cols = q.shape[-2], k.shape[-2]
+    single_token = rows == 1
+
+    block_mask = None
+
+    if causal and not single_token:
+        prefix_len = cols - rows
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return q_idx + prefix_len >= kv_idx
+
+        block_mask = create_block_mask(mask_mod, B = None, H = None, Q_LEN = rows, KV_LEN = cols, device = q.device)
+
+    return pt_flex_attention(q, k, v, block_mask = block_mask, scale = scale)
+
 # attention
 
 class Attention(Module):
@@ -45,7 +79,8 @@ class Attention(Module):
         heads = 8,
         causal = True,
         cross_attend_key_values = False,
-        rotary_embed: RotaryEmbedding | None = None
+        rotary_embed: RotaryEmbedding | None = None,
+        use_flex_attn = False
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -63,6 +98,10 @@ class Attention(Module):
         self.to_out = LinearNoBias(dim_inner, dim)
 
         self.rotary_embed = rotary_embed
+
+        assert not (use_flex_attn and not exists(pt_flex_attention)), 'flex attention is only available on torch 2.5.0 onwards'
+
+        self.use_flex_attn = use_flex_attn
 
     def forward(
         self,
@@ -99,18 +138,26 @@ class Attention(Module):
             k = cat((mk, k), dim = -2)
             v = cat((mv, v), dim = -2)
 
-        sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
+        rows, cols = q.shape[-2], k.shape[-2]
+        single_token = rows == 1
 
-        i, j = sim.shape[-2:]
+        if self.use_flex_attn:
+            out = flex_attention(
+                q, k, v,
+                causal = self.causal,
+                scale = self.scale
+            )
+        else:
+            sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
-        if self.causal and i > 1:
-            causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
-            mask_value = max_neg_value(sim)
-            sim = sim.masked_fill(causal_mask, mask_value)
+            if self.causal and not single_token:
+                causal_mask = torch.ones((rows, cols), dtype = torch.bool, device = sim.device).triu(cols - rows + 1)
+                mask_value = max_neg_value(sim)
+                sim = sim.masked_fill(causal_mask, mask_value)
 
-        attn = sim.softmax(dim = -1)
+            attn = sim.softmax(dim = -1)
 
-        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+            out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
         out = self.merge_heads(out)
         out = self.to_out(out)
@@ -118,7 +165,7 @@ class Attention(Module):
         if not return_memories:
             return out
 
-        return out, [k, v]
+        return out, (k, v)
 
 # feedforward
 
@@ -158,7 +205,8 @@ class Transformer(Module):
         ff_expansion_factor = 4,
         rotary_embed = True,
         dim_rotary = None,
-        final_norm = True
+        final_norm = True,
+        use_flex_attn = False
     ):
         super().__init__()
         assert not exists(self_attn_window_size) or self_attn_window_size >= 1
@@ -174,9 +222,9 @@ class Transformer(Module):
         layers = ModuleList([])
 
         for _ in range(depth):
-            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, rotary_embed = self.rotary_embed) if self_attn else None
+            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, rotary_embed = self.rotary_embed, use_flex_attn = use_flex_attn) if self_attn else None
 
-            cross_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend_key_values = True) if cross_attn else None
+            cross_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend_key_values = True, use_flex_attn = use_flex_attn) if cross_attn else None
 
             ff = Feedforward(dim = dim, expansion_factor = ff_expansion_factor)
 
@@ -283,7 +331,8 @@ class RLT(Module):
         dec_sliding_window_size = 16,
         rotary_embed = True,
         dim_rotary = None,
-        recurrent_transition: Module | None = None
+        recurrent_transition: Module | None = None,
+        use_flex_attn = False
     ):
         super().__init__()
         assert not exists(dec_sliding_window_size) or dec_sliding_window_size >= 1
@@ -295,7 +344,7 @@ class RLT(Module):
 
         # encoder
 
-        self.encoder = Transformer(dim, depth = enc_depth, dim_head = dim_head, heads = heads, rotary_embed = rotary_embed, dim_rotary = dim_rotary)
+        self.encoder = Transformer(dim, depth = enc_depth, dim_head = dim_head, heads = heads, rotary_embed = rotary_embed, dim_rotary = dim_rotary, use_flex_attn = use_flex_attn)
 
         # YOCO - Sun et al.
 
@@ -313,7 +362,7 @@ class RLT(Module):
 
         # decoder
 
-        self.decoder = Transformer(dim, depth = dec_depth, dim_head = dim_head, heads = heads, cross_attn = True, self_attn_window_size = dec_sliding_window_size, rotary_embed = rotary_embed, dim_rotary = dim_rotary)
+        self.decoder = Transformer(dim, depth = dec_depth, dim_head = dim_head, heads = heads, cross_attn = True, self_attn_window_size = dec_sliding_window_size, rotary_embed = rotary_embed, dim_rotary = dim_rotary, use_flex_attn = use_flex_attn)
 
         # to logits
 

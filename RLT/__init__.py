@@ -3,8 +3,4 @@ from RLT.RLT import (
     Transformer,
     Attention,
     Feedforward,
-    RLTMemories,
-    EncoderMemories,
-    DecoderMemories,
-    TransformerMemories
 )

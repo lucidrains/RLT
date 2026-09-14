@@ -7,6 +7,7 @@ param = pytest.mark.parametrize
 def exists(v):
     return v is not None
 
+@param('use_flex_attn', (False, True))
 @param('seq_len', (2, 16))
 @param('window_size', (1, 4))
 @param('num_tokens, return_loss', (
@@ -15,6 +16,7 @@ def exists(v):
     (256, True)
 ))
 def test_rlt(
+    use_flex_attn,
     seq_len,
     window_size,
     num_tokens,
@@ -25,7 +27,8 @@ def test_rlt(
         enc_depth = 2,
         dec_depth = 2,
         num_tokens = num_tokens,
-        dec_sliding_window_size = window_size
+        dec_sliding_window_size = window_size,
+        use_flex_attn = use_flex_attn
     )
 
     if exists(num_tokens):
@@ -43,14 +46,16 @@ def test_rlt(
 
     out.sum().backward()
 
+@param('use_flex_attn', (False, True))
 @param('num_tokens', (None, 256))
-def test_sequential_vs_parallel(num_tokens):
+def test_sequential_vs_parallel(use_flex_attn, num_tokens):
     model = RLT(
         dim = 64,
         enc_depth = 2,
         dec_depth = 2,
         num_tokens = num_tokens,
-        dec_sliding_window_size = 4
+        dec_sliding_window_size = 4,
+        use_flex_attn = use_flex_attn
     )
 
     model.eval()
@@ -74,3 +79,39 @@ def test_sequential_vs_parallel(num_tokens):
     sequential_out = torch.cat(sequential_outs, dim = 1)
 
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-5)
+
+@param('num_tokens', (None, 256))
+def test_flex_vs_manual(num_tokens):
+    torch.manual_seed(42)
+    model = RLT(
+        dim = 64,
+        enc_depth = 2,
+        dec_depth = 2,
+        num_tokens = num_tokens,
+        dec_sliding_window_size = 4,
+        use_flex_attn = False
+    )
+
+    model_flex = RLT(
+        dim = 64,
+        enc_depth = 2,
+        dec_depth = 2,
+        num_tokens = num_tokens,
+        dec_sliding_window_size = 4,
+        use_flex_attn = True
+    )
+
+    model_flex.load_state_dict(model.state_dict())
+
+    model.eval()
+    model_flex.eval()
+
+    if exists(num_tokens):
+        tokens = torch.randint(0, num_tokens, (2, 16))
+    else:
+        tokens = torch.randn(2, 16, 64)
+
+    parallel_out, _ = model(tokens)
+    parallel_out_flex, _ = model_flex(tokens)
+
+    assert torch.allclose(parallel_out, parallel_out_flex, atol = 1e-5)
