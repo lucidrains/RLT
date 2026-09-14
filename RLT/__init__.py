@@ -2,5 +2,9 @@ from RLT.RLT import (
     RLT,
     Transformer,
     Attention,
-    Feedforward
+    Feedforward,
+    RLTMemories,
+    EncoderMemories,
+    DecoderMemories,
+    TransformerMemories
 )

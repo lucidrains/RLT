@@ -30,8 +30,40 @@ def test_rlt(
         tokens = torch.randn(2, seq_len, 64)
         expected_shape = (2, seq_len, 64)
 
-    out = model(tokens)
+    out, _ = model(tokens)
 
     assert out.shape == expected_shape
 
     out.sum().backward()
+
+@param('num_tokens', (None, 256))
+def test_sequential_vs_parallel(num_tokens):
+    model = RLT(
+        dim = 64,
+        enc_depth = 2,
+        dec_depth = 2,
+        num_tokens = num_tokens,
+        dec_sliding_window_size = 4
+    )
+
+    model.eval()
+
+    seq_len = 16
+
+    if exists(num_tokens):
+        tokens = torch.randint(0, num_tokens, (2, seq_len))
+    else:
+        tokens = torch.randn(2, seq_len, 64)
+
+    parallel_out, _ = model(tokens)
+
+    memories = None
+    sequential_outs = []
+
+    for token in tokens.unbind(dim = 1):
+        step_out, memories = model(token[:, None], memories = memories)
+        sequential_outs.append(step_out)
+
+    sequential_out = torch.cat(sequential_outs, dim = 1)
+
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-5)

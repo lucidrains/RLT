@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import namedtuple
 from functools import partial
 
 import torch
@@ -11,6 +12,13 @@ from einops.layers.torch import Rearrange
 
 from torch_einops_utils import tree_map_tensor
 from rotary_embedding_torch import RotaryEmbedding
+
+# types
+
+RLTMemories = namedtuple('RLTMemories', ['encoder_memories', 'decoder_memories'])
+EncoderMemories = namedtuple('EncoderMemories', ['memories', 'keys_values'])
+DecoderMemories = namedtuple('DecoderMemories', ['state', 'memories'])
+TransformerMemories = namedtuple('TransformerMemories', ['step', 'memories'])
 
 # constants
 
@@ -93,8 +101,9 @@ class Attention(Module):
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
-        if self.causal and not exists(memories):
-            i, j = sim.shape[-2:]
+        i, j = sim.shape[-2:]
+
+        if self.causal and i > 1:
             causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
             mask_value = max_neg_value(sim)
             sim = sim.masked_fill(causal_mask, mask_value)
@@ -226,7 +235,7 @@ class Transformer(Module):
 
         next_step = step + seq_len
 
-        return out, (next_step, next_memories)
+        return out, TransformerMemories(next_step, next_memories)
 
 # the recurrent transition they propose
 
@@ -308,26 +317,46 @@ class RLT(Module):
 
     def forward(
         self,
-        tokens
+        tokens,
+        memories: RLTMemories | None = None
     ):
+        batch, seq_len = tokens.shape[:2]
+
         if exists(self.token_emb):
             tokens = self.token_emb(tokens)
 
-        encoded = self.encoder(tokens)
+        # memories
+
+        enc_memories, dec_memories = default(memories, (None, None))
+        enc_memories, prev_keys_values = default(enc_memories, (None, None))
+        state, dec_memories = default(dec_memories, (None, None))
+
+        # maybe initial state
+
+        if not exists(state):
+            state = repeat(self.initial_state, 'd -> b 1 d', b = batch)
+
+        # encode
+
+        encoded, next_enc_memories = self.encoder(tokens, memories = enc_memories, return_memories = True)
+
+        # keys and values for cross attention
 
         keys, values = self.encoded_to_keys_values(encoded).chunk(2, dim = -1)
-
         keys, values = (self.split_heads(t) for t in (keys, values))
+
+        prev_num_tokens = 0
+
+        if exists(prev_keys_values):
+            prev_keys, prev_values = prev_keys_values
+            prev_num_tokens = prev_keys.shape[-2]
+
+            keys = cat((prev_keys, keys), dim = -2)
+            values = cat((prev_values, values), dim = -2)
 
         # the main proposal, make the decoder of the YOCO setup looped
 
-        batch, seq_len = tokens.shape[:2]
-
-        state = repeat(self.initial_state, 'd -> b 1 d', b = batch)
-
         decoder_outputs = []
-
-        memories = None
 
         for index in range(seq_len):
 
@@ -341,9 +370,11 @@ class RLT(Module):
 
             # the keys and values cross attended to must be sliced
 
-            step_keys_values = (keys[:, :, :index + 1], values[:, :, :index + 1])
+            total_index = prev_num_tokens + index + 1
 
-            decoder_output, memories = self.decoder(decoder_token, keys_values = step_keys_values, memories = memories, return_memories = True)
+            step_keys_values = (keys[:, :, :total_index], values[:, :, :total_index])
+
+            decoder_output, dec_memories = self.decoder(decoder_token, keys_values = step_keys_values, memories = dec_memories, return_memories = True)
 
             # append for output
 
@@ -355,7 +386,11 @@ class RLT(Module):
 
         decoded = cat(decoder_outputs, dim = 1)
 
-        if not exists(self.to_logits):
-            return decoded
+        out = self.to_logits(decoded) if exists(self.to_logits) else decoded
 
-        return self.to_logits(decoded)
+        memories = RLTMemories(
+            EncoderMemories(next_enc_memories, (keys, values)),
+            DecoderMemories(state, dec_memories)
+        )
+
+        return out, memories
