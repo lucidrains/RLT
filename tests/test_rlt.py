@@ -7,13 +7,18 @@ param = pytest.mark.parametrize
 def exists(v):
     return v is not None
 
-@param('seq_len', (1, 16))
+@param('seq_len', (2, 16))
 @param('window_size', (1, 4))
-@param('num_tokens', (None, 256))
+@param('num_tokens, return_loss', (
+    (None, False),
+    (256, False),
+    (256, True)
+))
 def test_rlt(
     seq_len,
     window_size,
-    num_tokens
+    num_tokens,
+    return_loss
 ):
     model = RLT(
         dim = 64,
@@ -30,9 +35,11 @@ def test_rlt(
         tokens = torch.randn(2, seq_len, 64)
         expected_shape = (2, seq_len, 64)
 
-    out, _ = model(tokens)
+    out = model(tokens, return_loss = return_loss)
 
-    assert out.shape == expected_shape
+    if not return_loss:
+        out, _ = out
+        assert out.shape == expected_shape
 
     out.sum().backward()
 

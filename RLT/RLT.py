@@ -7,7 +7,7 @@ from torch import nn, cat
 from torch.nn import Module, ModuleList, Linear, Identity, Sequential, RMSNorm
 import torch.nn.functional as F
 
-from einops import einsum, repeat
+from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
 
 from torch_einops_utils import tree_map_tensor
@@ -318,12 +318,19 @@ class RLT(Module):
     def forward(
         self,
         tokens,
-        memories: RLTMemories | None = None
+        memories: RLTMemories | None = None,
+        return_loss = False
     ):
-        batch, seq_len = tokens.shape[:2]
+        # embed
 
         if exists(self.token_emb):
+
+            if return_loss:
+                tokens, labels = tokens[:, :-1], tokens[:, 1:]
+
             tokens = self.token_emb(tokens)
+
+        batch, seq_len = tokens.shape[:2]
 
         # memories
 
@@ -386,11 +393,20 @@ class RLT(Module):
 
         decoded = cat(decoder_outputs, dim = 1)
 
-        out = self.to_logits(decoded) if exists(self.to_logits) else decoded
-
         memories = RLTMemories(
             EncoderMemories(next_enc_memories, (keys, values)),
             DecoderMemories(state, dec_memories)
         )
 
-        return out, memories
+        if not exists(self.to_logits):
+            assert not return_loss
+            return decoded, memories
+
+        logits = self.to_logits(decoded)
+
+        if not return_loss:
+            return logits, memories
+
+        loss = F.cross_entropy(rearrange(logits, 'b n v -> b v n'), labels, ignore_index = -1)
+
+        return loss
