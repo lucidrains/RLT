@@ -2,11 +2,11 @@ from __future__ import annotations
 from functools import partial
 
 import torch
-from torch import nn
+from torch import nn, cat
 from torch.nn import Module, ModuleList, Linear, Identity, Sequential, RMSNorm
 import torch.nn.functional as F
 
-from einops import einsum
+from einops import einsum, repeat
 from einops.layers.torch import Rearrange
 
 # constants
@@ -150,6 +150,35 @@ class Transformer(Module):
 
         return self.norm(tokens)
 
+# the recurrent transition they propose
+
+class RecurrentTransition(Module):
+    def __init__(
+        self,
+        dim,
+        alpha = 1.
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.norm = RMSNorm(dim)
+        self.to_gates = Linear(dim * 2, dim)
+        self.to_state = LinearNoBias(dim, dim)
+
+    def forward(
+        self,
+        state,
+        encoded
+    ):
+        α = self.alpha
+
+        normed_state = self.norm(state)
+        gates = self.to_gates(cat((encoded, normed_state), dim = -1)).sigmoid()
+        state_out = self.to_state(normed_state)
+
+        # section 2.5, equations (2.9) - (2.11)
+
+        return encoded + α * gates * state_out
+
 # main class
 
 class RLT(Module):
@@ -161,7 +190,8 @@ class RLT(Module):
         dec_depth,
         dim_head = 64,
         heads = 8,
-        ff_expansion_factor = 4.
+        ff_expansion_factor = 4.,
+        alpha = 1.
     ):
         super().__init__()
 
@@ -180,6 +210,8 @@ class RLT(Module):
 
         self.initial_state = nn.Parameter(torch.randn(dim) * 1e-2)
 
+        self.combine_encoded_token_and_state = RecurrentTransition(dim, alpha = alpha)
+
         # decoder
 
         self.decoder = Transformer(dim, depth = dec_depth, dim_head = dim_head, heads = heads, cross_attend_key_values = True)
@@ -195,6 +227,38 @@ class RLT(Module):
 
         keys, values = (self.split_heads(t) for t in (keys, values))
 
-        decoded = self.decoder(encoded, keys_values = (keys, values))
+        # the main proposal, make the decoder of the YOCO setup looped
+
+        batch, seq_len = tokens.shape[:2]
+
+        state = repeat(self.initial_state, 'd -> b 1 d', b = batch)
+
+        decoder_outputs = []
+
+        for index in range(seq_len):
+
+            # one encoded token
+
+            encoded_token = encoded[:, index:index + 1]
+
+            # combine encoded token with state
+
+            decoder_token = self.combine_encoded_token_and_state(state, encoded_token)
+
+            # the keys and values cross attended to must be sliced
+
+            step_keys_values = (keys[:, :, :index + 1], values[:, :, :index + 1])
+
+            decoder_output = self.decoder(decoder_token, keys_values = step_keys_values)
+
+            # append for output
+
+            decoder_outputs.append(decoder_output)
+
+            # set next state as decoder output
+
+            state = decoder_output
+
+        decoded = cat(decoder_outputs, dim = 1)
 
         return decoded

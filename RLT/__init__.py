@@ -4,4 +4,3 @@ from RLT.RLT import (
     Attention,
     Feedforward
 )
-
