@@ -1,15 +1,25 @@
 import pytest
 import torch
-from RLT import RLT, Transformer
+from RLT import RLT
 
-def test_rlt():
+param = pytest.mark.parametrize
+
+@param('seq_len', (1, 16))
+@param('window_size', (1, 4))
+@param('batch_size', (1, 2))
+def test_rlt(
+    seq_len,
+    window_size,
+    batch_size
+):
     model = RLT(
-        dim = 512,
+        dim = 64,
         enc_depth = 2,
-        dec_depth = 2
+        dec_depth = 2,
+        dec_sliding_window_size = window_size
     )
 
-    tokens = torch.randn(2, 16, 512)
+    tokens = torch.randn(batch_size, seq_len, 64)
     out = model(tokens)
 
     assert out.shape == tokens.shape

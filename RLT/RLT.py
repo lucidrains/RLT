@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from einops import einsum, repeat
 from einops.layers.torch import Rearrange
 
+from torch_einops_utils import tree_map_tensor
+
 # constants
 
 LinearNoBias = partial(Linear, bias = False)
@@ -54,6 +56,7 @@ class Attention(Module):
         self,
         tokens,
         keys_values = None,
+        memories = None,
         return_memories = False
     ):
 
@@ -72,9 +75,14 @@ class Attention(Module):
 
         q = self.split_heads(q)
 
+        if exists(memories):
+            mk, mv = memories
+            k = cat((mk, k), dim = -2)
+            v = cat((mv, v), dim = -2)
+
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
-        if self.causal:
+        if self.causal and not exists(memories):
             i, j = sim.shape[-2:]
             causal_mask = torch.ones((i, j), dtype = torch.bool, device = sim.device).triu(j - i + 1)
             mask_value = max_neg_value(sim)
@@ -85,7 +93,12 @@ class Attention(Module):
         out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
         out = self.merge_heads(out)
-        return self.to_out(out)
+        out = self.to_out(out)
+
+        if not return_memories:
+            return out
+
+        return out, (k, v)
 
 # feedforward
 
@@ -119,20 +132,27 @@ class Transformer(Module):
         depth,
         dim_head = 64,
         heads = 8,
-        cross_attend_key_values = False,
+        self_attn = True,
+        cross_attn = False,
+        self_attn_window_size = None,
         ff_expansion_factor = 4,
         final_norm = True
     ):
         super().__init__()
+        assert not exists(self_attn_window_size) or self_attn_window_size >= 1
+
+        self.self_attn_window_size = self_attn_window_size
 
         layers = ModuleList([])
 
         for _ in range(depth):
-            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend_key_values = cross_attend_key_values)
+            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads) if self_attn else None
+
+            cross_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend_key_values = True) if cross_attn else None
 
             ff = Feedforward(dim = dim, expansion_factor = ff_expansion_factor)
 
-            layers.append(ModuleList([attn, ff]))
+            layers.append(ModuleList([self_attn, cross_attn, ff]))
 
         self.layers = layers
 
@@ -141,14 +161,49 @@ class Transformer(Module):
     def forward(
         self,
         tokens,
-        keys_values = None
+        keys_values = None,
+        memories = None,
+        return_memories = False
     ):
 
-        for attn, ff in self.layers:
-            tokens = attn(tokens, keys_values = keys_values) + tokens
+        iter_memories = iter(default(memories, []))
+        next_memories = []
+
+        # layers
+
+        for self_attn, cross_attn, ff in self.layers:
+
+            # self attention
+
+            if exists(self_attn):
+                self_attn_out, next_memory = self_attn(tokens, memories = next(iter_memories, None), return_memories = True)
+                tokens = self_attn_out + tokens
+
+                next_memories.append(next_memory)
+
+            # special cross attention from YOCO
+
+            if exists(cross_attn):
+                tokens = cross_attn(tokens, keys_values = keys_values) + tokens
+
+            # feedforward
+
             tokens = ff(tokens) + tokens
 
-        return self.norm(tokens)
+        # norm
+
+        out = self.norm(tokens)
+
+        if not return_memories:
+            return out
+
+        # maybe take care of sliding window size - since always doing one token at a time, just do like inference where one slices off the earlier end
+
+        if exists(self.self_attn_window_size):
+            w = self.self_attn_window_size
+            next_memories = tree_map_tensor(lambda t: t[..., -(w - 1):, :] if w > 1 else t[..., :0, :], next_memories)
+
+        return out, next_memories
 
 # the recurrent transition they propose
 
@@ -191,9 +246,11 @@ class RLT(Module):
         dim_head = 64,
         heads = 8,
         ff_expansion_factor = 4.,
-        alpha = 1.
+        recurrent_transition_alpha = 1.,
+        dec_sliding_window_size = 16,
     ):
         super().__init__()
+        assert not exists(dec_sliding_window_size) or dec_sliding_window_size >= 1
 
         dim_inner = dim_head * heads
 
@@ -210,11 +267,11 @@ class RLT(Module):
 
         self.initial_state = nn.Parameter(torch.randn(dim) * 1e-2)
 
-        self.combine_encoded_token_and_state = RecurrentTransition(dim, alpha = alpha)
+        self.combine_encoded_token_and_state = RecurrentTransition(dim, alpha = recurrent_transition_alpha)
 
         # decoder
 
-        self.decoder = Transformer(dim, depth = dec_depth, dim_head = dim_head, heads = heads, cross_attend_key_values = True)
+        self.decoder = Transformer(dim, depth = dec_depth, dim_head = dim_head, heads = heads, cross_attn = True, self_attn_window_size = dec_sliding_window_size)
 
     def forward(
         self,
@@ -235,6 +292,8 @@ class RLT(Module):
 
         decoder_outputs = []
 
+        memories = None
+
         for index in range(seq_len):
 
             # one encoded token
@@ -249,7 +308,7 @@ class RLT(Module):
 
             step_keys_values = (keys[:, :, :index + 1], values[:, :, :index + 1])
 
-            decoder_output = self.decoder(decoder_token, keys_values = step_keys_values)
+            decoder_output, memories = self.decoder(decoder_token, keys_values = step_keys_values, memories = memories, return_memories = True)
 
             # append for output
 
