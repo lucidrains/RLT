@@ -1,6 +1,6 @@
 <img src="./rlt.png" width="400"></img>
 
-## RLT (wip)
+## RLT (Recurrent Looped Transformer)
 
 Unofficial implementation of the [Recurrent Looped Transformer](https://yifanzhang-pro.github.io/recurrent-looped-tranformer/) proposed by Yifan Zhang of Princeton.
 
