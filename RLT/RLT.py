@@ -89,6 +89,7 @@ except ImportError:
 def flex_attention(
     q, k, v,
     causal = False,
+    sliding_window_size = None,
     scale = None
 ):
     assert exists(pt_flex_attention), 'flex_attention requires torch >= 2.5.0'
@@ -98,11 +99,16 @@ def flex_attention(
 
     block_mask = None
 
-    if causal and not single_token:
+    if (causal or exists(sliding_window_size)) and not single_token:
         prefix_len = cols - rows
 
         def mask_mod(b, h, q_idx, kv_idx):
-            return q_idx + prefix_len >= kv_idx
+            mask = True
+            if causal:
+                mask = mask & (q_idx + prefix_len >= kv_idx)
+            if exists(sliding_window_size):
+                mask = mask & (q_idx + prefix_len - kv_idx < sliding_window_size)
+            return mask
 
         block_mask = create_block_mask(mask_mod, B = None, H = None, Q_LEN = rows, KV_LEN = cols, device = q.device)
 
@@ -119,12 +125,13 @@ class Attention(Module):
         causal = True,
         cross_attend_key_values = False,
         rotary_embed: RotaryEmbedding | None = None,
+        sliding_window_size: int | None = None,
         use_flex_attn = False
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
-        self.causal = causal and not cross_attend_key_values
+        self.causal = causal
 
         self.norm = RMSNorm(dim)
 
@@ -137,6 +144,7 @@ class Attention(Module):
         self.to_out = LinearNoBias(dim_inner, dim)
 
         self.rotary_embed = rotary_embed
+        self.sliding_window_size = sliding_window_size
 
         assert not (use_flex_attn and not exists(pt_flex_attention)), 'flex attention is only available on torch 2.5.0 onwards'
 
@@ -184,15 +192,25 @@ class Attention(Module):
             out = flex_attention(
                 q, k, v,
                 causal = self.causal,
+                sliding_window_size = self.sliding_window_size,
                 scale = self.scale
             )
         else:
             sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
 
+            mask = None
+            prefix_len = cols - rows
+
             if self.causal and not single_token:
-                causal_mask = torch.ones((rows, cols), dtype = torch.bool, device = sim.device).triu(cols - rows + 1)
-                mask_value = max_neg_value(sim)
-                sim = sim.masked_fill(causal_mask, mask_value)
+                causal_mask = torch.ones((rows, cols), dtype = torch.bool, device = sim.device).triu(prefix_len + 1)
+                mask = causal_mask
+
+            if exists(self.sliding_window_size) and not single_token:
+                window_mask = torch.ones((rows, cols), dtype = torch.bool, device = sim.device).tril(prefix_len - self.sliding_window_size)
+                mask = window_mask if mask is None else (mask | window_mask)
+
+            if exists(mask):
+                sim = sim.masked_fill(mask, max_neg_value(sim))
 
             attn = sim.softmax(dim = -1)
 
@@ -261,7 +279,7 @@ class Transformer(Module):
         layers = ModuleList([])
 
         for _ in range(depth):
-            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, rotary_embed = self.rotary_embed, use_flex_attn = use_flex_attn) if self_attn else None
+            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, rotary_embed = self.rotary_embed, sliding_window_size = self.self_attn_window_size, use_flex_attn = use_flex_attn) if self_attn else None
 
             cross_attn = Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend_key_values = True, use_flex_attn = use_flex_attn) if cross_attn else None
 
@@ -346,6 +364,7 @@ class RecurrentTransition(Module):
         α = self.alpha
 
         normed_state = self.norm(state)
+        encoded, normed_state = torch.broadcast_tensors(encoded, normed_state)
         gates = self.to_gates(cat((encoded, normed_state), dim = -1)).sigmoid()
         state_out = self.to_state(normed_state)
 
@@ -368,6 +387,7 @@ class RLT(Module):
         ff_expansion_factor = 4.,
         recurrent_transition_alpha = 1.,
         dec_sliding_window_size = 16,
+        recurrent_block_size = 1,
         rotary_embed = True,
         dim_rotary = None,
         recurrent_transition: Module | None = None,
@@ -377,6 +397,9 @@ class RLT(Module):
         super().__init__()
         has_num_tokens = exists(num_tokens)
         self.has_num_tokens = has_num_tokens
+
+        assert recurrent_block_size >= 1
+        self.recurrent_block_size = recurrent_block_size
 
         self.token_emb = nn.Embedding(num_tokens, dim) if has_num_tokens else None
 
@@ -532,32 +555,36 @@ class RLT(Module):
         # the main proposal, make the decoder of the YOCO setup looped
 
         decoder_outputs = []
+        block_size = self.recurrent_block_size
+        curr = 0
 
-        for index in range(seq_len):
+        while curr < seq_len:
+            # block ends on a recurrent block boundary, unless it is the final block
 
-            # one encoded token
+            block_len = min(block_size - (prev_num_tokens + curr) % block_size, seq_len - curr)
 
-            encoded_token = encoded[:, index:index + 1]
+            encoded_block = encoded[:, curr : curr + block_len]
+            curr += block_len
+            total_index = prev_num_tokens + curr
 
-            # combine encoded token with state
+            # combine encoded block with state (relies on broadcasting)
 
-            decoder_token = self.combine_encoded_token_and_state(state, encoded_token)
+            decoder_block = self.combine_encoded_token_and_state(state, encoded_block)
 
             # the keys and values cross attended to must be sliced
 
-            total_index = prev_num_tokens + index + 1
-
             step_keys_values = (keys[:, :, :total_index], values[:, :, :total_index])
 
-            decoder_output, dec_memories = self.decoder(decoder_token, keys_values = step_keys_values, memories = dec_memories, return_memories = True)
+            decoder_output, dec_memories = self.decoder(decoder_block, keys_values = step_keys_values, memories = dec_memories, return_memories = True)
 
             # append for output
 
             decoder_outputs.append(decoder_output)
 
-            # set next state as decoder output
+            # set next state as decoder output only at a block boundary
 
-            state = decoder_output
+            if divisible_by(total_index, block_size):
+                state = decoder_output[:, -1:]
 
             # truncated bptt
 

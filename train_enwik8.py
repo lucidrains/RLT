@@ -71,18 +71,20 @@ def train(
     validate_every: int = 100,
     generate_every: int = 100,
     prime_length: int = 32,
-    generate_length: int = 64,
-    seq_len: int = 64,
+    generate_length: int | None = None,
+    seq_len: int = 128,
     dim: int = 256,
     enc_depth: int = 6,
     dec_depth: int = 2,
     dec_sliding_window_size: int = 8,
+    recurrent_block_size: int = 16,
     recurrent_transition_alpha: float = 1.,
     filter_thres: float = 0.9,
     temperature: float = 1.,
     cpu: bool = False,
     data_path: str = "./data/enwik8.gz"
 ):
+    generate_length = default(generate_length, seq_len)
     accelerator = Accelerator(cpu = cpu)
 
     # prepare enwik8 data
@@ -105,6 +107,7 @@ def train(
         enc_depth = enc_depth,
         dec_depth = dec_depth,
         dec_sliding_window_size = dec_sliding_window_size,
+        recurrent_block_size = recurrent_block_size,
         recurrent_transition_alpha = recurrent_transition_alpha
     )
 
@@ -159,16 +162,14 @@ def train(
             accelerator.print(f"\n--- [Step {step}] GENERATION ---")
             accelerator.print(f"PROMPT: {prime}")
 
-            prompt = inp[None, ...]
-
             sampled = unwrapped_model.generate(
-                prompt,
+                inp,
                 max_len = generate_length,
                 temperature = temperature,
                 filter_kwargs = dict(thres = filter_thres)
             )
 
-            decoded_output = decode_tokens(sampled[0])
+            decoded_output = decode_tokens(sampled)
             accelerator.print(f"OUTPUT: {decoded_output}\n")
 
     accelerator.end_training()

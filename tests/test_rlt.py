@@ -52,14 +52,16 @@ def test_rlt(
         assert sampled.shape == (2, 5)
 
 @param('use_flex_attn', (False, True))
+@param('recurrent_block_size', (1, 4))
 @param('num_tokens', (None, 256))
-def test_sequential_vs_parallel(use_flex_attn, num_tokens):
+def test_sequential_vs_parallel(use_flex_attn, recurrent_block_size, num_tokens):
     model = RLT(
         dim = 64,
         enc_depth = 2,
         dec_depth = 2,
         num_tokens = num_tokens,
         dec_sliding_window_size = 4,
+        recurrent_block_size = recurrent_block_size,
         use_flex_attn = use_flex_attn
     )
 
