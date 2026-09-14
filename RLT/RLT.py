@@ -283,6 +283,7 @@ class RLT(Module):
         dec_sliding_window_size = 16,
         rotary_embed = True,
         dim_rotary = None,
+        recurrent_transition: Module | None = None
     ):
         super().__init__()
         assert not exists(dec_sliding_window_size) or dec_sliding_window_size >= 1
@@ -305,7 +306,10 @@ class RLT(Module):
 
         self.initial_state = nn.Parameter(torch.randn(dim) * 1e-2)
 
-        self.combine_encoded_token_and_state = RecurrentTransition(dim, alpha = recurrent_transition_alpha)
+        if not exists(recurrent_transition):
+            recurrent_transition = RecurrentTransition(dim, alpha = recurrent_transition_alpha)
+
+        self.combine_encoded_token_and_state = recurrent_transition
 
         # decoder
 
