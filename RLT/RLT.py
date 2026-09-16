@@ -1,19 +1,21 @@
 from __future__ import annotations
+
 from collections import namedtuple
 from functools import partial
 from math import ceil
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
-from torch import nn, cat, Tensor, is_tensor
-from torch.nn import Module, ModuleList, Linear, Identity, Sequential, RMSNorm, Parameter
+from torch import nn, cat, tensor, Tensor, is_tensor
+from torch.nn import Module, ModuleList, Linear, Sequential, RMSNorm, Parameter
 import torch.nn.functional as F
 
 from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
 
-from torch_einops_utils import tree_map_tensor, temp_eval, pack_with_inverse, tree_map_detach
 from rotary_embedding_torch import RotaryEmbedding
+
+from torch_einops_utils import pack_with_inverse, repeat_interleave_to_match, temp_eval, tree_map_detach, tree_map_tensor
 
 # types
 
@@ -152,6 +154,7 @@ class Attention(Module):
         dim,
         dim_head = 64,
         heads = 8,
+        kv_heads: int | None = None,
         causal = True,
         cross_attend_key_values = False,
         rotary_embed: RotaryEmbedding | None = None,
@@ -163,12 +166,18 @@ class Attention(Module):
         dim_inner = dim_head * heads
         self.causal = causal
 
+        kv_heads = default(kv_heads, heads)
+        assert divisible_by(heads, kv_heads), f'heads ({heads}) must be divisible by kv_heads ({kv_heads})'
+
+        dim_kv_inner = dim_head * kv_heads
+
         self.norm = RMSNorm(dim)
 
         self.to_queries = LinearNoBias(dim, dim_inner)
-        self.to_key_values = LinearNoBias(dim, dim_inner * 2) if not cross_attend_key_values else None
+        self.to_key_values = LinearNoBias(dim, dim_kv_inner * 2) if not cross_attend_key_values else None
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.split_queries = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.split_key_values = Rearrange('b n (h d) -> b h n d', h = kv_heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
         self.to_out = LinearNoBias(dim_inner, dim)
@@ -198,11 +207,11 @@ class Attention(Module):
         if not exists(keys_values):
             assert exists(self.to_key_values), 'keys_values must be provided for cross attention'
             k, v = self.to_key_values(tokens).chunk(2, dim = -1)
-            k, v = (self.split_heads(t) for t in (k, v))
+            k, v = (self.split_key_values(t) for t in (k, v))
         else:
             k, v = keys_values
 
-        q = self.split_heads(q)
+        q = self.split_queries(q)
 
         # rotary embedding
 
@@ -214,6 +223,13 @@ class Attention(Module):
             mk, mv = memories
             k = cat((mk, k), dim = -2)
             v = cat((mv, v), dim = -2)
+
+        return_kv = (k, v)
+
+        # grouped query attention - repeat key / values to match the query heads, if needed
+
+        k = repeat_interleave_to_match(k, q, dim = -3)
+        v = repeat_interleave_to_match(v, q, dim = -3)
 
         rows, cols = q.shape[-2], k.shape[-2]
         single_token = rows == 1
@@ -252,7 +268,7 @@ class Attention(Module):
         if not return_memories:
             return out
 
-        return out, (k, v)
+        return out, return_kv
 
 # feedforward
 
@@ -326,6 +342,8 @@ class Transformer(Module):
         depth,
         dim_head = 64,
         heads = 8,
+        kv_heads: int | None = None,
+        cross_attn_kv_heads: int | None = None,
         self_attn = True,
         cross_attn = False,
         self_attn_window_size = None,
@@ -350,9 +368,9 @@ class Transformer(Module):
         layers = ModuleList([])
 
         for _ in range(depth):
-            self_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, rotary_embed = self.rotary_embed, sliding_window_size = self.self_attn_window_size, use_flex_attn = use_flex_attn) if self_attn else None
+            self_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, kv_heads = kv_heads, rotary_embed = self.rotary_embed, sliding_window_size = self.self_attn_window_size, use_flex_attn = use_flex_attn) if self_attn else None
 
-            cross_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend_key_values = True, use_flex_attn = use_flex_attn) if cross_attn else None
+            cross_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, kv_heads = cross_attn_kv_heads, cross_attend_key_values = True, use_flex_attn = use_flex_attn) if cross_attn else None
 
             ff = Feedforward(dim = dim, expansion_factor = ff_expansion_factor)
 
@@ -381,6 +399,16 @@ class Transformer(Module):
         else:
             block_outputs = [tokens]
 
+        # keys and values can either be a single (keys, values) pair shared by all layers, or one pair per layer
+
+        if exists(keys_values):
+            if is_tensor(keys_values[0]):
+                keys_values = (keys_values,) * len(self.layers)
+            else:
+                assert len(keys_values) == len(self.layers), f'expected {len(self.layers)} (keys, values) pairs, received {len(keys_values)}'
+
+        iter_keys_values = iter(default(keys_values, ()))
+
         # layers
 
         for self_attn, cross_attn, ff, attn_residual in self.layers:
@@ -396,7 +424,8 @@ class Transformer(Module):
             # special cross attention from YOCO
 
             if exists(cross_attn):
-                tokens = cross_attn(tokens, keys_values = keys_values) + tokens
+                layer_keys_values = next(iter_keys_values, None)
+                tokens = cross_attn(tokens, keys_values = layer_keys_values) + tokens
 
             # feedforward
 
@@ -427,10 +456,13 @@ class RecurrentTransition(Module):
     def __init__(
         self,
         dim,
-        alpha = 1.
+        alpha = 1.,
+        learned_alpha = False
     ):
         super().__init__()
-        self.alpha = alpha
+        self.learned_alpha = learned_alpha
+        self.alpha = Parameter(tensor(alpha)) if learned_alpha else alpha
+
         self.norm = RMSNorm(dim)
         self.to_gates = Linear(dim * 2, dim)
         self.to_state = LinearNoBias(dim, dim)
@@ -440,7 +472,7 @@ class RecurrentTransition(Module):
         state,
         encoded
     ):
-        α = self.alpha
+        α = F.softplus(self.alpha) if self.learned_alpha else self.alpha
 
         normed_state = self.norm(state)
         encoded, normed_state = torch.broadcast_tensors(encoded, normed_state)
@@ -463,6 +495,10 @@ class RLT(Module):
         num_tokens = None,
         dim_head = 64,
         heads = 8,
+        kv_heads: int | None = None,
+        cross_attn_kv_heads: int | None = None,
+        num_kv_layers: int | None = None,
+        layer_to_layer_mapping: Sequence[int] | None = None,
         ff_expansion_factor = 4.,
         recurrent_transition_alpha = 1.,
         dec_sliding_window_size = 16,
@@ -484,12 +520,36 @@ class RLT(Module):
 
         self.token_emb = nn.Embedding(num_tokens, dim) if has_num_tokens else None
 
-        dim_inner = dim_head * heads
+        # resolve the mapping from decoder layers to the encoded key / value layers
+
+        if exists(layer_to_layer_mapping):
+            layer_to_layer_mapping = tuple(layer_to_layer_mapping)
+            num_kv_layers = default(num_kv_layers, max(layer_to_layer_mapping) + 1)
+
+            assert len(layer_to_layer_mapping) == dec_depth, f'layer_to_layer_mapping must have length {dec_depth}'
+            assert all(0 <= layer_index < num_kv_layers for layer_index in layer_to_layer_mapping), f'layer_to_layer_mapping indices must be in the range [0, {num_kv_layers})'
+        else:
+            num_kv_layers = default(num_kv_layers, 1)
+
+            assert num_kv_layers in (1, dec_depth), 'layer_to_layer_mapping must be specified if num_kv_layers is neither 1 nor equal to dec_depth'
+
+            layer_to_layer_mapping = tuple(range(dec_depth)) if num_kv_layers == dec_depth else (0,) * dec_depth
+
+        self.layer_to_layer_mapping = layer_to_layer_mapping
+
+        # grouped query attention - `kv_heads` applies to all attention, `cross_attn_kv_heads` overrides the cross attention
+
+        cross_attn_kv_heads = default(cross_attn_kv_heads, default(kv_heads, heads))
+
+        assert divisible_by(heads, cross_attn_kv_heads), f'heads ({heads}) must be divisible by cross_attn_kv_heads ({cross_attn_kv_heads})'
+
+        dim_kv_inner = dim_head * cross_attn_kv_heads
 
         # transformer settings
 
         transformer_kwargs = dict(
             heads = heads,
+            kv_heads = kv_heads,
             dim_head = dim_head,
             ff_expansion_factor = ff_expansion_factor,
             rotary_embed = rotary_embed,
@@ -507,10 +567,10 @@ class RLT(Module):
 
         self.to_encoded_key_values = Sequential(
             RMSNorm(dim),
-            LinearNoBias(dim, dim_inner * 2)
+            LinearNoBias(dim, num_kv_layers * dim_kv_inner * 2)
         )
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.split_heads = Rearrange('b n (l h d) -> l b h n d', l = num_kv_layers, h = cross_attn_kv_heads)
 
         # recurrence related
 
@@ -525,7 +585,14 @@ class RLT(Module):
 
         # decoder
 
-        self.decoder = Transformer(dim, depth = dec_depth, cross_attn = True, self_attn_window_size = dec_sliding_window_size, **transformer_kwargs)
+        self.decoder = Transformer(
+            dim,
+            depth = dec_depth,
+            cross_attn = True,
+            cross_attn_kv_heads = cross_attn_kv_heads,
+            self_attn_window_size = dec_sliding_window_size,
+            **transformer_kwargs
+        )
 
         # to logits
 
@@ -668,9 +735,14 @@ class RLT(Module):
 
             decoder_block = self.combine_encoded_token_and_state(state, encoded_block)
 
-            # the keys and values cross attended to must be sliced
+            # slice the encoded key / values to the current sequence position, and map each decoder layer to its encoded layer
 
-            step_keys_values = (keys[:, :, :total_index], values[:, :, :total_index])
+            step_keys, step_values = tree_map_tensor(
+                lambda t: t[list(self.layer_to_layer_mapping)],
+                (keys[..., :total_index, :], values[..., :total_index, :])
+            )
+
+            step_keys_values = tuple(zip(step_keys, step_values))
 
             decoder_output, dec_memories = self.decoder(decoder_block, keys_values = step_keys_values, memories = dec_memories, return_memories = True)
 

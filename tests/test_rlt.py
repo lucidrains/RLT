@@ -7,6 +7,10 @@ param = pytest.mark.parametrize
 def exists(v):
     return v is not None
 
+def skip_if_flex_attn_unsupported(use_flex_attn):
+    if use_flex_attn and not torch.cuda.is_available():
+        pytest.skip('flex attention only supports backward on cuda')
+
 @param('attn_residual', (False, True))
 @param('use_flex_attn', (False, True))
 @param('seq_len', (2, 16))
@@ -16,19 +20,30 @@ def exists(v):
     (256, False),
     (256, True)
 ))
+@param('kv_heads, cross_attn_kv_heads', (
+    (None, None),
+    (2, None),
+    (None, 2)
+))
 def test_rlt(
     attn_residual,
     use_flex_attn,
     seq_len,
     window_size,
     num_tokens,
-    return_loss
+    return_loss,
+    kv_heads,
+    cross_attn_kv_heads
 ):
+    skip_if_flex_attn_unsupported(use_flex_attn)
+
     model = RLT(
         dim = 64,
         enc_depth = 2,
         dec_depth = 2,
         num_tokens = num_tokens,
+        kv_heads = kv_heads,
+        cross_attn_kv_heads = cross_attn_kv_heads,
         dec_sliding_window_size = window_size,
         use_flex_attn = use_flex_attn,
         tbptt_step_size = 2,
@@ -58,12 +73,33 @@ def test_rlt(
 @param('use_flex_attn', (False, True))
 @param('recurrent_block_size', (1, 4))
 @param('num_tokens', (None, 256))
-def test_sequential_vs_parallel(attn_residual, use_flex_attn, recurrent_block_size, num_tokens):
+@param('kv_heads', (None, 2))
+@param('num_kv_layers, layer_to_layer_mapping', (
+    (None, None),
+    (1, None),
+    (2, None),
+    (None, (0, 0)),
+    (3, (0, 2))
+))
+def test_sequential_vs_parallel(
+    attn_residual,
+    use_flex_attn,
+    recurrent_block_size,
+    num_tokens,
+    kv_heads,
+    num_kv_layers,
+    layer_to_layer_mapping
+):
+    skip_if_flex_attn_unsupported(use_flex_attn)
+
     model = RLT(
         dim = 64,
         enc_depth = 2,
         dec_depth = 2,
         num_tokens = num_tokens,
+        kv_heads = kv_heads,
+        num_kv_layers = num_kv_layers,
+        layer_to_layer_mapping = layer_to_layer_mapping,
         dec_sliding_window_size = 4,
         recurrent_block_size = recurrent_block_size,
         use_flex_attn = use_flex_attn,
@@ -94,13 +130,17 @@ def test_sequential_vs_parallel(attn_residual, use_flex_attn, recurrent_block_si
 
 @param('attn_residual', (False, True))
 @param('num_tokens', (None, 256))
-def test_flex_vs_manual(attn_residual, num_tokens):
+@param('kv_heads', (None, 2))
+def test_flex_vs_manual(attn_residual, num_tokens, kv_heads):
+    skip_if_flex_attn_unsupported(True)
+
     torch.manual_seed(42)
     model = RLT(
         dim = 64,
         enc_depth = 2,
         dec_depth = 2,
         num_tokens = num_tokens,
+        kv_heads = kv_heads,
         dec_sliding_window_size = 4,
         use_flex_attn = False,
         attn_residual = attn_residual
@@ -111,6 +151,7 @@ def test_flex_vs_manual(attn_residual, num_tokens):
         enc_depth = 2,
         dec_depth = 2,
         num_tokens = num_tokens,
+        kv_heads = kv_heads,
         dec_sliding_window_size = 4,
         use_flex_attn = True,
         attn_residual = attn_residual
