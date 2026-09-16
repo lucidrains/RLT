@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import namedtuple
-from functools import partial
+from functools import partial, wraps
 from math import ceil
 from typing import Callable, Sequence
 
@@ -44,6 +44,26 @@ def divisible_by(num, den):
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
+
+# decorator for a forward returning (primary, *outputs) - `@maybe_return('memories', 'hiddens')` gives a `return_all = True` flag that returns all as a namedtuple
+
+def maybe_return(*field_names, primary = 'tokens', flag = 'return_all'):
+    def decorator(fn):
+        output_type = namedtuple('Output', (primary, *field_names))
+
+        @wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            return_all = kwargs.pop(flag, False)
+            out = fn(self, *args, **kwargs)
+
+            if not return_all:
+                return out[0]
+
+            return output_type(*out)
+
+        return wrapper
+
+    return decorator
 
 # sampling helpers
 
@@ -380,13 +400,14 @@ class Transformer(Module):
 
         self.layers = layers
 
+    @maybe_return('memories', 'hiddens')
     def forward(
         self,
         tokens,
         keys_values = None,
         memories = None,
-        return_memories = False,
-        block_outputs: list[Tensor] | None = None
+        block_outputs: list[Tensor] | None = None,
+        return_all = False
     ):
         seq_len = tokens.shape[-2]
 
@@ -431,14 +452,14 @@ class Transformer(Module):
 
             tokens = ff(tokens) + tokens
 
+            # keep the hidden states for the attention residual
+
+            block_outputs.append(tokens)
+
             # attention residual
 
             if exists(attn_residual):
-                block_outputs.append(tokens)
                 tokens = attn_residual(block_outputs)
-
-        if not return_memories:
-            return tokens
 
         # maybe take care of sliding window size - since always doing one token at a time, just do like inference where one slices off the earlier end
 
@@ -448,7 +469,7 @@ class Transformer(Module):
 
         next_step = step + seq_len
 
-        return tokens, TransformerMemories(next_step, next_memories)
+        return tokens, TransformerMemories(next_step, next_memories), block_outputs
 
 # the recurrent transition they propose
 
@@ -509,7 +530,8 @@ class RLT(Module):
         use_flex_attn = False,
         tbptt_step_size: int | None = None,
         attn_residual = False,
-        attn_residual_query_key_rank: int | None = None
+        attn_residual_query_key_rank: int | None = None,
+        attn_residual_cross_encoder = False
     ):
         super().__init__()
         has_num_tokens = exists(num_tokens)
@@ -544,6 +566,12 @@ class RLT(Module):
         assert divisible_by(heads, cross_attn_kv_heads), f'heads ({heads}) must be divisible by cross_attn_kv_heads ({cross_attn_kv_heads})'
 
         dim_kv_inner = dim_head * cross_attn_kv_heads
+
+        # whether the decoder attention residual should also attend to the encoder hiddens
+
+        assert not attn_residual_cross_encoder or attn_residual, 'attn_residual must be enabled for the decoder attention residual to attend to encoder hiddens'
+
+        self.attn_residual_cross_encoder = attn_residual_cross_encoder
 
         # transformer settings
 
@@ -700,7 +728,7 @@ class RLT(Module):
 
         # encode
 
-        encoded, next_enc_memories = self.encoder(tokens, memories = enc_memories, return_memories = True)
+        encoded, next_enc_memories, encoder_hiddens = self.encoder(tokens, memories = enc_memories, return_all = True)
 
         # keys and values for cross attention
 
@@ -728,6 +756,11 @@ class RLT(Module):
             block_len = min(block_size - (prev_num_tokens + curr) % block_size, seq_len - curr)
 
             encoded_block = encoded[:, curr : curr + block_len]
+
+            # encoder hiddens, sliced to the current block, to be fed into the attention residual of the decoder, if enabled
+
+            step_encoder_hiddens = [h[:, curr : curr + block_len] for h in encoder_hiddens] if self.attn_residual_cross_encoder else []
+
             curr += block_len
             total_index = prev_num_tokens + curr
 
@@ -744,7 +777,13 @@ class RLT(Module):
 
             step_keys_values = tuple(zip(step_keys, step_values))
 
-            decoder_output, dec_memories = self.decoder(decoder_block, keys_values = step_keys_values, memories = dec_memories, return_memories = True)
+            decoder_output, dec_memories, _ = self.decoder(
+                decoder_block,
+                keys_values = step_keys_values,
+                memories = dec_memories,
+                return_all = True,
+                block_outputs = [*step_encoder_hiddens, decoder_block]
+            )
 
             # append for output
 
