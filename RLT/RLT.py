@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import namedtuple
-from functools import partial, wraps
+from functools import partial
 from math import ceil
 from typing import Callable, Sequence
 
@@ -15,7 +15,7 @@ from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
 
-from torch_einops_utils import pack_with_inverse, repeat_interleave_to_match, temp_eval, tree_map_detach, tree_map_tensor
+from torch_einops_utils import maybe_return, pack_with_inverse, repeat_interleave_to_match, temp_eval, tree_map_detach, tree_map_tensor
 
 # types
 
@@ -44,26 +44,6 @@ def divisible_by(num, den):
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
-
-# decorator for a forward returning (primary, *outputs) - `@maybe_return('memories', 'hiddens')` gives a `return_all = True` flag that returns all as a namedtuple
-
-def maybe_return(*field_names, primary = 'tokens', flag = 'return_all'):
-    def decorator(fn):
-        output_type = namedtuple('Output', (primary, *field_names))
-
-        @wraps(fn)
-        def wrapper(self, *args, **kwargs):
-            return_all = kwargs.pop(flag, False)
-            out = fn(self, *args, **kwargs)
-
-            if not return_all:
-                return out[0]
-
-            return output_type(*out)
-
-        return wrapper
-
-    return decorator
 
 # sampling helpers
 
@@ -379,6 +359,7 @@ class Transformer(Module):
         assert not exists(dim_rotary) or dim_rotary <= dim_head
 
         self.self_attn_window_size = self_attn_window_size
+        self.has_attn_residual = attn_residual
 
         # rotary embedding
 
@@ -407,7 +388,7 @@ class Transformer(Module):
         keys_values = None,
         memories = None,
         block_outputs: list[Tensor] | None = None,
-        return_all = False
+        return_hiddens = False
     ):
         seq_len = tokens.shape[-2]
 
@@ -415,10 +396,12 @@ class Transformer(Module):
         iter_memories = iter(memories)
         next_memories = []
 
-        if exists(block_outputs):
-            block_outputs = [block_outputs] if is_tensor(block_outputs) else list(block_outputs)
-        else:
-            block_outputs = [tokens]
+        # keep the hidden states only if they are needed for the attention residual, or explicitly requested
+
+        keep_hiddens = return_hiddens or self.has_attn_residual or exists(block_outputs)
+
+        if keep_hiddens:
+            block_outputs = [block_outputs] if is_tensor(block_outputs) else list(default(block_outputs, [tokens]))
 
         # keys and values can either be a single (keys, values) pair shared by all layers, or one pair per layer
 
@@ -454,7 +437,8 @@ class Transformer(Module):
 
             # keep the hidden states for the attention residual
 
-            block_outputs.append(tokens)
+            if keep_hiddens:
+                block_outputs.append(tokens)
 
             # attention residual
 
@@ -571,6 +555,7 @@ class RLT(Module):
 
         assert not attn_residual_cross_encoder or attn_residual, 'attn_residual must be enabled for the decoder attention residual to attend to encoder hiddens'
 
+        self.attn_residual = attn_residual
         self.attn_residual_cross_encoder = attn_residual_cross_encoder
 
         # transformer settings
@@ -728,7 +713,15 @@ class RLT(Module):
 
         # encode
 
-        encoded, next_enc_memories, encoder_hiddens = self.encoder(tokens, memories = enc_memories, return_all = True)
+        encoder_out = self.encoder(
+            tokens,
+            memories = enc_memories,
+            return_memories = True,
+            return_hiddens = self.attn_residual_cross_encoder
+        )
+
+        encoded, next_enc_memories = encoder_out.tokens, encoder_out.memories
+        encoder_hiddens = encoder_out.hiddens if self.attn_residual_cross_encoder else []
 
         # keys and values for cross attention
 
@@ -757,9 +750,9 @@ class RLT(Module):
 
             encoded_block = encoded[:, curr : curr + block_len]
 
-            # encoder hiddens, sliced to the current block, to be fed into the attention residual of the decoder, if enabled
+            # encoder hiddens, sliced to the current block, to be fed into the attention residual of the decoder
 
-            step_encoder_hiddens = [h[:, curr : curr + block_len] for h in encoder_hiddens] if self.attn_residual_cross_encoder else []
+            step_encoder_hiddens = [h[:, curr : curr + block_len] for h in encoder_hiddens]
 
             curr += block_len
             total_index = prev_num_tokens + curr
@@ -777,12 +770,12 @@ class RLT(Module):
 
             step_keys_values = tuple(zip(step_keys, step_values))
 
-            decoder_output, dec_memories, _ = self.decoder(
+            decoder_output, dec_memories = self.decoder(
                 decoder_block,
                 keys_values = step_keys_values,
                 memories = dec_memories,
-                return_all = True,
-                block_outputs = [*step_encoder_hiddens, decoder_block]
+                return_memories = True,
+                block_outputs = [*step_encoder_hiddens, decoder_block] if self.attn_residual else None
             )
 
             # append for output
