@@ -1,6 +1,6 @@
 import pytest
 import torch
-from RLT import RLT
+from RLT import RLT, slice_recurrent_lengths
 
 param = pytest.mark.parametrize
 
@@ -11,6 +11,7 @@ def skip_if_flex_attn_unsupported(use_flex_attn):
     if use_flex_attn and not torch.cuda.is_available():
         pytest.skip('flex attention only supports backward on cuda')
 
+@param('custom_recurrent_lengths', (False, True))
 @param('next_latent_prediction', (False, True))
 @param('attn_residual', (False, True))
 @param('use_flex_attn', (False, True))
@@ -27,6 +28,7 @@ def skip_if_flex_attn_unsupported(use_flex_attn):
     (None, 2)
 ))
 def test_rlt(
+    custom_recurrent_lengths,
     next_latent_prediction,
     attn_residual,
     use_flex_attn,
@@ -60,7 +62,13 @@ def test_rlt(
         tokens = torch.randn(2, seq_len, 64)
         expected_shape = (2, seq_len, 64)
 
-    out = model(tokens, return_loss = return_loss)
+    recurrent_lengths = None
+
+    if custom_recurrent_lengths:
+        eff_seq_len = seq_len - 1 if (return_loss and not next_latent_prediction and exists(num_tokens)) else seq_len
+        recurrent_lengths = slice_recurrent_lengths((1, 2, 5, 2, 1, 3, 2, 4, 1, 2), eff_seq_len)
+
+    out = model(tokens, return_loss = return_loss, recurrent_lengths = recurrent_lengths)
 
     if not return_loss:
         out, _ = out
@@ -71,6 +79,115 @@ def test_rlt(
     if exists(num_tokens):
         sampled = model.generate(tokens, max_len = seq_len + 5)
         assert sampled.shape == (2, 5)
+
+@param('recurrent_lengths', (
+    (1, 2, 5, 2, 1),
+    (2, 2, 2, 2, 2, 1),
+    (11,),
+    (1,) * 11,
+    (3, 8),
+))
+@param('attn_residual', (False, True))
+@param('num_tokens', (None, 256))
+def test_custom_recurrent_lengths(
+    recurrent_lengths,
+    attn_residual,
+    num_tokens
+):
+    model = RLT(
+        dim = 64,
+        enc_depth = 2,
+        dec_depth = 2,
+        num_tokens = num_tokens,
+        attn_residual = attn_residual,
+        dec_sliding_window_size = 4
+    )
+
+    seq_len = sum(recurrent_lengths)
+
+    if exists(num_tokens):
+        tokens = torch.randint(0, num_tokens, (2, seq_len))
+        expected_shape = (2, seq_len, num_tokens)
+    else:
+        tokens = torch.randn(2, seq_len, 64)
+        expected_shape = (2, seq_len, 64)
+
+    out, _ = model(tokens, recurrent_lengths = recurrent_lengths)
+    assert out.shape == expected_shape
+
+    out.sum().backward()
+
+    # validate sequential vs parallel with custom recurrent lengths
+
+    model.eval()
+
+    parallel_out, _ = model(tokens, recurrent_lengths = recurrent_lengths)
+
+    memories = None
+    sequential_outs = []
+    curr = 0
+
+    for block_len in recurrent_lengths:
+        chunk = tokens[:, curr : curr + block_len]
+        step_out, memories = model(chunk, memories = memories, recurrent_lengths = (block_len,))
+        sequential_outs.append(step_out)
+        curr += block_len
+
+    sequential_out = torch.cat(sequential_outs, dim = 1)
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-5)
+
+    # validate that invalid recurrent lengths trigger lucidrains assert
+
+    with pytest.raises(AssertionError):
+        model(tokens, recurrent_lengths = (*recurrent_lengths, 1))
+
+    # validate slice_recurrent_lengths and generate with custom recurrent lengths
+
+    prompt_len = min(3, seq_len)
+    prompt_lengths = slice_recurrent_lengths(recurrent_lengths, prompt_len)
+    assert sum(prompt_lengths) == prompt_len
+
+    if exists(num_tokens):
+        prompt = tokens[:, :prompt_len]
+        sampled = model.generate(prompt, recurrent_lengths = recurrent_lengths)
+        assert sampled.shape == (2, seq_len - prompt_len)
+
+        sampled_block_size = model.generate(prompt, max_len = seq_len, recurrent_lengths = 2)
+        assert sampled_block_size.shape == (2, seq_len - prompt_len)
+
+@param('prompt_len', (1, 2, 3, 5))
+@param('block_size', (1, 2, 3))
+def test_custom_recurrent_lengths_equivalent_to_fixed_block_size(
+    block_size,
+    prompt_len
+):
+    seq_len = 12
+
+    model = RLT(
+        dim = 64,
+        enc_depth = 2,
+        dec_depth = 2,
+        num_tokens = 256,
+        dec_sliding_window_size = 4,
+        recurrent_block_size = block_size
+    )
+
+    tokens = torch.randint(0, 256, (2, seq_len))
+    recurrent_lengths = (block_size,) * (seq_len // block_size)
+
+    model.eval()
+
+    fixed_out, _ = model(tokens)
+    custom_out, _ = model(tokens, recurrent_lengths = recurrent_lengths)
+
+    assert torch.allclose(fixed_out, custom_out, atol = 1e-5)
+
+    prompt = tokens[:, :prompt_len]
+
+    fixed_sampled = model.generate(prompt, max_len = seq_len, temperature = 0.)
+    custom_sampled = model.generate(prompt, recurrent_lengths = recurrent_lengths, temperature = 0.)
+
+    assert torch.equal(fixed_sampled, custom_sampled)
 
 @param('attn_residual', (False, True))
 @param('use_flex_attn', (False, True))

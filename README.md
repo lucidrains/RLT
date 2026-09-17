@@ -56,6 +56,23 @@ loss = model(tokens, return_loss = True)
 loss.backward()
 ```
 
+The recurrent block size can also vary across the sequence by passing `recurrent_lengths` - a sequence of block lengths that must sum to the sequence length
+
+```python
+block_lengths = (1, 2, 5, 2, 1, 3)
+
+tokens = torch.randint(0, 256, (2, sum(block_lengths)))
+
+loss = model(tokens, return_loss = True, recurrent_lengths = block_lengths)
+loss.backward()
+
+# during generation, the recurrent state only advances at the block boundaries
+
+prompt = torch.randint(0, 256, (2, 2))
+
+sampled = model.generate(prompt, recurrent_lengths = block_lengths)
+```
+
 ## Test
 
 Train on enwik8

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import namedtuple
 from functools import partial
+from itertools import accumulate
 from math import ceil
 from typing import Callable, Sequence
 
@@ -49,6 +50,30 @@ def divisible_by(num, den):
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
+
+def to_tuple(t):
+    if is_tensor(t):
+        return tuple(t.tolist())
+    elif isinstance(t, list):
+        return tuple(t)
+
+    return t
+
+def slice_recurrent_lengths(recurrent_lengths, length: int):
+    recurrent_lengths = to_tuple(recurrent_lengths)
+
+    if not exists(recurrent_lengths):
+        return None
+
+    if isinstance(recurrent_lengths, int):
+        num_full, rem = divmod(length, recurrent_lengths)
+        return (recurrent_lengths,) * num_full + ((rem,) if rem else ())
+
+    if not recurrent_lengths or length <= 0:
+        return ()
+
+    first, *rest = recurrent_lengths
+    return (min(first, length), *slice_recurrent_lengths(rest, length - first))
 
 # sampling helpers
 
@@ -733,12 +758,29 @@ class RLT(Module):
         max_len: int | None = None,
         temperature: float = 1.,
         filter_fn: Callable = top_k,
-        filter_kwargs: dict = dict(frac_num_tokens = 0.1)
+        filter_kwargs: dict = dict(frac_num_tokens = 0.1),
+        recurrent_lengths: int | Sequence[int] | None = None
     ):
         assert self.has_num_tokens, '`num_tokens` must be passed to RLT to generate'
 
+        recurrent_lengths = to_tuple(default(recurrent_lengths, self.recurrent_block_size))
+        has_custom_lengths = isinstance(recurrent_lengths, tuple)
+
         max_len = default(max_len, seq_len)
+
+        if has_custom_lengths:
+            max_len = default(max_len, sum(recurrent_lengths))
+
         assert exists(max_len), 'max_len must be supplied'
+
+        if has_custom_lengths:
+            assert all(isinstance(l, int) and l > 0 for l in recurrent_lengths), 'recurrent lengths must be a sequence of positive integers'
+            assert sum(recurrent_lengths) == max_len, f'sum of recurrent lengths ({sum(recurrent_lengths)}) must equal max_len ({max_len})'
+
+            boundaries = set(accumulate(recurrent_lengths))
+            is_boundary = lambda idx: idx in boundaries
+        else:
+            is_boundary = lambda idx: divisible_by(idx, recurrent_lengths)
 
         filter_fn = default(filter_fn, identity)
         filter_kwargs = default(filter_kwargs, {})
@@ -749,7 +791,8 @@ class RLT(Module):
 
         prompt = prompt.to(self.device)
 
-        sample_num_times = max(0, max_len - prompt.shape[-1])
+        prompt_len = prompt.shape[-1]
+        sample_num_times = max(0, max_len - prompt_len)
 
         if sample_num_times == 0:
             return inverse_pack(prompt[:, :0])
@@ -758,7 +801,9 @@ class RLT(Module):
 
         # catch up memories with prompt
 
-        step_out, memories = self(prompt)
+        prompt_recurrent_lengths = slice_recurrent_lengths(recurrent_lengths, prompt_len)
+
+        step_out, memories = self(prompt, recurrent_lengths = prompt_recurrent_lengths, update_state = is_boundary)
 
         # sample first token
 
@@ -771,8 +816,12 @@ class RLT(Module):
 
         # generate remaining tokens step-by-step with recurrent state
 
-        for _ in range(sample_num_times - 1):
-            step_out, memories = self(sampled, memories = memories)
+        for token_idx in range(sample_num_times - 1):
+            total_index = prompt_len + 1 + token_idx
+
+            update_state = is_boundary(total_index)
+
+            step_out, memories = self(sampled, memories = memories, update_state = update_state)
 
             logits = step_out[:, -1]
             filtered_logits = filter_fn(logits, **filter_kwargs)
@@ -792,7 +841,9 @@ class RLT(Module):
         tokens,
         memories: RLTMemories | None = None,
         return_loss = False,
-        return_loss_breakdown = False
+        return_loss_breakdown = False,
+        recurrent_lengths: int | Sequence[int] | None = None,
+        update_state: bool | None = None
     ):
         # embed
 
@@ -805,6 +856,17 @@ class RLT(Module):
             tokens = self.token_emb(tokens)
 
         batch, seq_len = tokens.shape[:2]
+
+        # recurrent block size or custom lengths
+
+        recurrent_lengths = to_tuple(default(recurrent_lengths, self.recurrent_block_size))
+        has_custom_lengths = isinstance(recurrent_lengths, tuple)
+
+        if has_custom_lengths:
+            assert all(isinstance(l, int) and l > 0 for l in recurrent_lengths), 'recurrent lengths must be a sequence of positive integers'
+            assert sum(recurrent_lengths) == seq_len, f'sum of recurrent lengths ({sum(recurrent_lengths)}) must equal sequence length ({seq_len})'
+
+            block_lens = iter(recurrent_lengths)
 
         # memories
 
@@ -846,13 +908,12 @@ class RLT(Module):
         # the main proposal, make the decoder of the YOCO setup looped
 
         decoder_outputs = []
-        block_size = self.recurrent_block_size
         curr = 0
 
         while curr < seq_len:
             # block ends on a recurrent block boundary, unless it is the final block
 
-            block_len = min(block_size - (prev_num_tokens + curr) % block_size, seq_len - curr)
+            block_len = next(block_lens) if has_custom_lengths else min(recurrent_lengths - (prev_num_tokens + curr) % recurrent_lengths, seq_len - curr)
 
             encoded_block = encoded[:, curr : curr + block_len]
 
@@ -890,7 +951,9 @@ class RLT(Module):
 
             # set next state as decoder output only at a block boundary
 
-            if divisible_by(total_index, block_size):
+            should_update_state = update_state(total_index) if callable(update_state) else default(update_state, has_custom_lengths or divisible_by(total_index, recurrent_lengths))
+
+            if should_update_state:
                 state = decoder_output[:, -1:]
 
             # truncated bptt
