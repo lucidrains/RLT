@@ -59,21 +59,24 @@ def to_tuple(t):
 
     return t
 
-def slice_recurrent_lengths(recurrent_lengths, length: int):
+def slice_recurrent_lengths(recurrent_lengths, length: int, offset: int = 0):
     recurrent_lengths = to_tuple(recurrent_lengths)
 
-    if not exists(recurrent_lengths):
-        return None
+    if not recurrent_lengths or length <= 0:
+        return () if exists(recurrent_lengths) else None
 
     if isinstance(recurrent_lengths, int):
-        num_full, rem = divmod(length, recurrent_lengths)
-        return (recurrent_lengths,) * num_full + ((rem,) if rem else ())
-
-    if not recurrent_lengths or length <= 0:
-        return ()
+        first = min((-offset) % recurrent_lengths or recurrent_lengths, length)
+        num_full, rem = divmod(length - first, recurrent_lengths)
+        return (first,) + (recurrent_lengths,) * num_full + ((rem,) if rem else ())
 
     first, *rest = recurrent_lengths
-    return (min(first, length), *slice_recurrent_lengths(rest, length - first))
+
+    if offset >= first:
+        return slice_recurrent_lengths(rest, length, offset - first)
+
+    first_len = min(first - offset, length)
+    return (first_len, *slice_recurrent_lengths(rest, length - first_len))
 
 # sampling helpers
 
@@ -616,7 +619,7 @@ class RLT(Module):
         ff_expansion_factor = 4.,
         recurrent_transition_alpha = 1.,
         dec_sliding_window_size = 16,
-        recurrent_block_size = 1,
+        recurrent_block_size: int | Sequence[int] = 1,
         rotary_embed = True,
         dim_rotary = None,
         recurrent_transition: Module | None = None,
@@ -634,9 +637,7 @@ class RLT(Module):
         super().__init__()
         has_num_tokens = exists(num_tokens)
         self.has_num_tokens = has_num_tokens
-
-        assert recurrent_block_size >= 1
-        self.recurrent_block_size = recurrent_block_size
+        self.recurrent_block_size = to_tuple(recurrent_block_size)
 
         self.token_emb = nn.Embedding(num_tokens, dim) if has_num_tokens else None
 
@@ -763,24 +764,19 @@ class RLT(Module):
     ):
         assert self.has_num_tokens, '`num_tokens` must be passed to RLT to generate'
 
-        recurrent_lengths = to_tuple(default(recurrent_lengths, self.recurrent_block_size))
-        has_custom_lengths = isinstance(recurrent_lengths, tuple)
+        recurrent_lengths = default(recurrent_lengths, self.recurrent_block_size)
+        is_custom = not isinstance(recurrent_lengths, int)
 
-        max_len = default(max_len, seq_len)
-
-        if has_custom_lengths:
-            max_len = default(max_len, sum(recurrent_lengths))
-
+        max_len = default(max_len, sum(to_tuple(recurrent_lengths)) if is_custom else seq_len)
         assert exists(max_len), 'max_len must be supplied'
 
-        if has_custom_lengths:
-            assert all(isinstance(l, int) and l > 0 for l in recurrent_lengths), 'recurrent lengths must be a sequence of positive integers'
-            assert sum(recurrent_lengths) == max_len, f'sum of recurrent lengths ({sum(recurrent_lengths)}) must equal max_len ({max_len})'
+        recurrent_lengths = slice_recurrent_lengths(recurrent_lengths, max_len)
 
-            boundaries = set(accumulate(recurrent_lengths))
-            is_boundary = lambda idx: idx in boundaries
-        else:
-            is_boundary = lambda idx: divisible_by(idx, recurrent_lengths)
+        assert all(isinstance(l, int) and l > 0 for l in recurrent_lengths), 'recurrent lengths must be a sequence of positive integers'
+        assert sum(recurrent_lengths) == max_len, f'sum of recurrent lengths ({sum(recurrent_lengths)}) must equal max_len ({max_len})'
+
+        boundaries = set(accumulate(recurrent_lengths))
+        is_boundary = lambda idx: idx in boundaries
 
         filter_fn = default(filter_fn, identity)
         filter_kwargs = default(filter_kwargs, {})
@@ -821,7 +817,7 @@ class RLT(Module):
 
             update_state = is_boundary(total_index)
 
-            step_out, memories = self(sampled, memories = memories, update_state = update_state)
+            step_out, memories = self(sampled, memories = memories, recurrent_lengths = (1,), update_state = update_state)
 
             logits = step_out[:, -1]
             filtered_logits = filter_fn(logits, **filter_kwargs)
@@ -857,22 +853,25 @@ class RLT(Module):
 
         batch, seq_len = tokens.shape[:2]
 
-        # recurrent block size or custom lengths
-
-        recurrent_lengths = to_tuple(default(recurrent_lengths, self.recurrent_block_size))
-        has_custom_lengths = isinstance(recurrent_lengths, tuple)
-
-        if has_custom_lengths:
-            assert all(isinstance(l, int) and l > 0 for l in recurrent_lengths), 'recurrent lengths must be a sequence of positive integers'
-            assert sum(recurrent_lengths) == seq_len, f'sum of recurrent lengths ({sum(recurrent_lengths)}) must equal sequence length ({seq_len})'
-
-            block_lens = iter(recurrent_lengths)
-
         # memories
 
         enc_memories, dec_memories = default(memories, (None, None))
         enc_memories, prev_keys_values = default(enc_memories, (None, None))
         state, dec_memories = default(dec_memories, (None, None))
+
+        prev_num_tokens = prev_keys_values[0].shape[-2] if exists(prev_keys_values) else 0
+
+        # recurrent lengths
+
+        block_size = default(recurrent_lengths, self.recurrent_block_size)
+        is_custom = not isinstance(block_size, int)
+
+        recurrent_lengths = to_tuple(block_size) if is_custom else slice_recurrent_lengths(block_size, seq_len, prev_num_tokens)
+
+        assert all(isinstance(l, int) and l > 0 for l in recurrent_lengths), 'recurrent lengths must be a sequence of positive integers'
+        assert sum(recurrent_lengths) == seq_len, f'sum of recurrent lengths ({sum(recurrent_lengths)}) must equal sequence length ({seq_len})'
+
+        is_boundary = (lambda _: True) if is_custom else (lambda idx: divisible_by(idx, block_size))
 
         # maybe initial state
 
@@ -896,12 +895,8 @@ class RLT(Module):
         keys, values = self.to_encoded_key_values(encoded).chunk(2, dim = -1)
         keys, values = (self.split_heads(t) for t in (keys, values))
 
-        prev_num_tokens = 0
-
         if exists(prev_keys_values):
             prev_keys, prev_values = prev_keys_values
-            prev_num_tokens = prev_keys.shape[-2]
-
             keys = cat((prev_keys, keys), dim = -2)
             values = cat((prev_values, values), dim = -2)
 
@@ -910,11 +905,7 @@ class RLT(Module):
         decoder_outputs = []
         curr = 0
 
-        while curr < seq_len:
-            # block ends on a recurrent block boundary, unless it is the final block
-
-            block_len = next(block_lens) if has_custom_lengths else min(recurrent_lengths - (prev_num_tokens + curr) % recurrent_lengths, seq_len - curr)
-
+        for block_len in recurrent_lengths:
             encoded_block = encoded[:, curr : curr + block_len]
 
             # encoder hiddens, sliced to the current block, to be fed into the attention residual of the decoder
@@ -951,7 +942,7 @@ class RLT(Module):
 
             # set next state as decoder output only at a block boundary
 
-            should_update_state = update_state(total_index) if callable(update_state) else default(update_state, has_custom_lengths or divisible_by(total_index, recurrent_lengths))
+            should_update_state = update_state(total_index) if callable(update_state) else default(update_state, is_boundary(total_index))
 
             if should_update_state:
                 state = decoder_output[:, -1:]
