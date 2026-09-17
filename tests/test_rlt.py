@@ -11,6 +11,7 @@ def skip_if_flex_attn_unsupported(use_flex_attn):
     if use_flex_attn and not torch.cuda.is_available():
         pytest.skip('flex attention only supports backward on cuda')
 
+@param('next_latent_prediction', (False, True))
 @param('attn_residual', (False, True))
 @param('use_flex_attn', (False, True))
 @param('seq_len', (2, 16))
@@ -26,6 +27,7 @@ def skip_if_flex_attn_unsupported(use_flex_attn):
     (None, 2)
 ))
 def test_rlt(
+    next_latent_prediction,
     attn_residual,
     use_flex_attn,
     seq_len,
@@ -47,7 +49,8 @@ def test_rlt(
         dec_sliding_window_size = window_size,
         use_flex_attn = use_flex_attn,
         tbptt_step_size = 2,
-        attn_residual = attn_residual
+        attn_residual = attn_residual,
+        next_lat_loss = next_latent_prediction
     )
 
     if exists(num_tokens):

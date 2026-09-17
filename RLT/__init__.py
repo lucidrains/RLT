@@ -5,4 +5,6 @@ from RLT.RLT import (
     Feedforward,
     LoRALinear,
     AttentionResidual,
+    NextLatentPrediction,
+    Losses
 )

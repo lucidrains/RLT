@@ -41,6 +41,21 @@ prompt = torch.randint(0, 256, (2, 32))
 sampled = model.generate(prompt, max_len = 128) # (2, 96)
 ```
 
+To turn on [Next-Latent Prediction](https://arxiv.org/abs/2511.05963) (Teoh et al.):
+
+```python
+model = RLT(
+    num_tokens = 256,
+    dim = 512,
+    enc_depth = 4,
+    dec_depth = 4,
+    next_lat_loss = True
+)
+
+loss = model(tokens, return_loss = True)
+loss.backward()
+```
+
 ## Test
 
 Train on enwik8
@@ -82,5 +97,17 @@ $ uv run train_enwik8.py
     archivePrefix = {arXiv},
     primaryClass = {cs.CL},
     url     = {https://arxiv.org/abs/2603.15031},
+}
+```
+
+```bibtex
+@misc{teoh2025nextlatentpredictiontransformerslearn,
+    title     = {Next-Latent Prediction Transformers Learn Compact World Models},
+    author    = {Jayden Teoh and Manan Tomar and Kwangjun Ahn and Edward S. Hu and Tim Pearce and Pratyusha Sharma and Akshay Krishnamurthy and Riashat Islam and Alex Lamb and John Langford},
+    year      = {2025},
+    eprint    = {2511.05963},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url       = {https://arxiv.org/abs/2511.05963}
 }
 ```

@@ -10,12 +10,16 @@ from torch import nn, cat, tensor, Tensor, is_tensor
 from torch.nn import Module, ModuleList, Linear, Sequential, RMSNorm, Parameter
 import torch.nn.functional as F
 
+from torch.func import functional_call
+
 from einops import einsum, rearrange, repeat
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
 
-from torch_einops_utils import maybe_return, pack_with_inverse, repeat_interleave_to_match, temp_eval, tree_map_detach, tree_map_tensor
+from x_mlps_pytorch import MLP
+
+from torch_einops_utils import masked_mean, maybe_return, pack_with_inverse, repeat_interleave_to_match, temp_eval, tree_map_detach, tree_map_tensor
 
 # types
 
@@ -23,6 +27,7 @@ RLTMemories = namedtuple('RLTMemories', ['encoder_memories', 'decoder_memories']
 EncoderMemories = namedtuple('EncoderMemories', ['memories', 'keys_values'])
 DecoderMemories = namedtuple('DecoderMemories', ['state', 'memories'])
 TransformerMemories = namedtuple('TransformerMemories', ['step', 'memories'])
+Losses = namedtuple('Losses', ['cross_entropy', 'next_latent', 'kl_div'])
 
 # constants
 
@@ -332,6 +337,85 @@ class AttentionResidual(Module):
 
         return einsum(attn, past_layers, 'b n l, b n l d -> b n d')
 
+# next-latent prediction
+# Jayden Teoh et al. https://arxiv.org/abs/2511.05963
+
+class NextLatentPrediction(Module):
+    def __init__(
+        self,
+        dim,
+        depth = 3,
+        num_rollouts = 1
+    ):
+        super().__init__()
+        self.num_rollouts = num_rollouts
+
+        self.norm = RMSNorm(dim * 2)
+
+        dims = (dim * 2, *(dim,) * (depth - 1), dim)
+
+        self.mlp = MLP(*dims, activation = nn.GELU(), bias = False)
+
+        # zero init the last linear layer so dynamics starts as identity
+
+        nn.init.zeros_(self.mlp.layers[-1].weight)
+
+    def rollout_loss(
+        self,
+        hiddens,
+        token_embeds,
+        teacher_logits,
+        to_logits,
+        labels,
+        kl_loss_weight = 1.
+    ):
+        num_rollouts = self.num_rollouts
+        assert hiddens.shape[1] > num_rollouts, f'sequence length ({hiddens.shape[1]}) must be greater than num_rollouts ({num_rollouts})'
+
+        total_latent_loss = 0.
+        total_kl_loss = 0.
+
+        pred_h, target_h, next_tokens = hiddens, hiddens, token_embeds
+        mask = labels != -1
+
+        has_kl = kl_loss_weight > 0.
+        lm_head_params = {k: v.detach() for k, v in to_logits.named_parameters()} if has_kl else None
+
+        for i in range(num_rollouts):
+            if i > 0:
+                mask = mask[:, 1:]
+
+            pred_h = pred_h[:, :-1]
+            next_tokens = next_tokens[:, 1:]
+            target_h = target_h[:, 1:]
+
+            pred_h = self(pred_h, next_tokens)
+
+            # next latent loss, stop-gradient on the target
+
+            latent_loss = F.smooth_l1_loss(pred_h, target_h.detach(), reduction = 'none').mean(dim = -1)
+            total_latent_loss = total_latent_loss + masked_mean(latent_loss, mask)
+
+            # distill teacher next token logits through a frozen lm head
+
+            if has_kl and teacher_logits.shape[1] > 1:
+                teacher_logits = teacher_logits[:, 1:]
+
+                student_logits = functional_call(to_logits, lm_head_params, pred_h[:, :-1])
+
+                log_p = F.log_softmax(student_logits, dim = -1)
+                log_q = F.log_softmax(teacher_logits.detach(), dim = -1)
+
+                kl = F.kl_div(log_p, log_q, log_target = True, reduction = 'none').sum(dim = -1)
+                total_kl_loss = total_kl_loss + masked_mean(kl, mask[:, 1:])
+
+        return total_latent_loss / num_rollouts, total_kl_loss / num_rollouts
+
+    def forward(self, current_states, next_token_embeds):
+        x = cat((current_states, next_token_embeds), dim = -1)
+        x = self.norm(x)
+        return self.mlp(x) + current_states
+
 # transformer
 
 class Transformer(Module):
@@ -515,7 +599,12 @@ class RLT(Module):
         tbptt_step_size: int | None = None,
         attn_residual = False,
         attn_residual_query_key_rank: int | None = None,
-        attn_residual_cross_encoder = False
+        attn_residual_cross_encoder = False,
+        next_lat_loss = False,
+        next_latent_loss_weight = 0.,
+        next_latent_kl_loss_weight = 1.,
+        next_latent_num_rollouts = 1,
+        next_latent_dynamics_depth = 3
     ):
         super().__init__()
         has_num_tokens = exists(num_tokens)
@@ -525,6 +614,21 @@ class RLT(Module):
         self.recurrent_block_size = recurrent_block_size
 
         self.token_emb = nn.Embedding(num_tokens, dim) if has_num_tokens else None
+
+        # next latent prediction (Teoh et al. https://arxiv.org/abs/2511.05963)
+
+        if next_lat_loss and next_latent_loss_weight == 0.:
+            next_latent_loss_weight = 1.
+
+        self.has_next_latent_loss = has_num_tokens and next_latent_loss_weight > 0.
+        self.next_latent_loss_weight = next_latent_loss_weight
+        self.next_latent_kl_loss_weight = next_latent_kl_loss_weight
+
+        self.next_latent_prediction = NextLatentPrediction(
+            dim = dim,
+            depth = next_latent_dynamics_depth,
+            num_rollouts = next_latent_num_rollouts
+        ) if self.has_next_latent_loss else None
 
         # resolve the mapping from decoder layers to the encoded key / value layers
 
@@ -688,14 +792,16 @@ class RLT(Module):
         tokens,
         memories: RLTMemories | None = None,
         return_loss = False,
+        return_loss_breakdown = False
     ):
         # embed
 
         if self.has_num_tokens:
 
-            if return_loss:
+            if return_loss and not self.has_next_latent_loss:
                 tokens, labels = tokens[:, :-1], tokens[:, 1:]
 
+            raw_tokens = tokens
             tokens = self.token_emb(tokens)
 
         batch, seq_len = tokens.shape[:2]
@@ -808,6 +914,41 @@ class RLT(Module):
         if not return_loss:
             return logits, memories
 
-        loss = F.cross_entropy(rearrange(logits, 'b n v -> b v n'), labels, ignore_index = -1)
+        if not self.has_next_latent_loss:
+            cross_entropy_loss = F.cross_entropy(rearrange(logits, 'b n v -> b v n'), labels, ignore_index = -1)
 
-        return loss
+            if not return_loss_breakdown:
+                return cross_entropy_loss
+
+            return cross_entropy_loss, Losses(cross_entropy_loss, None, None)
+
+        # next-latent prediction loss (Teoh et al. https://arxiv.org/abs/2511.05963)
+
+        labels = raw_tokens[:, 1:]
+        teacher_logits = logits[:, :-1]
+
+        cross_entropy_loss = F.cross_entropy(
+            rearrange(teacher_logits, 'b n v -> b v n'),
+            labels,
+            ignore_index = -1
+        )
+
+        next_latent_loss, kl_div_loss = self.next_latent_prediction.rollout_loss(
+            decoded,
+            tokens,
+            teacher_logits,
+            self.to_logits,
+            labels,
+            kl_loss_weight = self.next_latent_kl_loss_weight
+        )
+
+        total_loss = (
+            cross_entropy_loss +
+            next_latent_loss * self.next_latent_loss_weight +
+            kl_div_loss * self.next_latent_kl_loss_weight
+        )
+
+        if not return_loss_breakdown:
+            return total_loss
+
+        return total_loss, Losses(cross_entropy_loss, next_latent_loss, kl_div_loss)
