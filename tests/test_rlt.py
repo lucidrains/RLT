@@ -291,3 +291,57 @@ def test_flex_vs_manual(attn_residual, num_tokens, kv_heads):
     parallel_out_flex, _ = model_flex(tokens)
 
     assert torch.allclose(parallel_out, parallel_out_flex, atol = 1e-5)
+
+def test_shared_weights_equal_depth():
+    model = RLT(
+        dim = 64,
+        enc_depth = 2,
+        dec_depth = 2,
+        num_tokens = 256,
+        dec_sliding_window_size = 4,
+        shared_weights = True
+    )
+
+    assert model.shared_weights
+
+    # verify that self_attn and ff are shared across encoder and decoder layers
+
+    for enc_layer, dec_layer in zip(model.encoder.layers, model.decoder.layers):
+        enc_self_attn_norm, enc_self_attn, _, _, enc_ff_norm, enc_ff, _ = enc_layer
+        dec_self_attn_norm, dec_self_attn, _, _, dec_ff_norm, dec_ff, _ = dec_layer
+
+        assert enc_self_attn is dec_self_attn
+        assert enc_ff is dec_ff
+
+        # verify stage-specific normalizations remain separate
+
+        assert enc_self_attn_norm is not dec_self_attn_norm
+        assert enc_ff_norm is not dec_ff_norm
+
+    # forward and backward
+
+    tokens = torch.randint(0, 256, (2, 16))
+    loss = model(tokens, return_loss = True)
+    loss.backward()
+
+    for enc_layer, dec_layer in zip(model.encoder.layers, model.decoder.layers):
+        enc_self_attn_norm, enc_self_attn, _, _, enc_ff_norm, enc_ff, _ = enc_layer
+        dec_self_attn_norm, dec_self_attn, _, _, dec_ff_norm, dec_ff, _ = dec_layer
+
+        assert dec_self_attn.to_queries.weight.grad is not None
+        assert dec_ff[0].weight.grad is not None
+        assert enc_self_attn_norm.weight.grad is not None
+        assert dec_self_attn_norm.weight.grad is not None
+        assert enc_ff_norm.weight.grad is not None
+        assert dec_ff_norm.weight.grad is not None
+
+    # generate
+
+    prompt = torch.randint(0, 256, (2, 4))
+    sampled = model.generate(prompt, max_len = 16)
+    assert sampled.shape == (2, 12)
+
+    # asserting unequal depths when sharing weights
+
+    with pytest.raises(AssertionError):
+        RLT(dim = 64, enc_depth = 3, dec_depth = 2, shared_weights = True)

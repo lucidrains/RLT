@@ -204,8 +204,6 @@ class Attention(Module):
 
         dim_kv_inner = dim_head * kv_heads
 
-        self.norm = RMSNorm(dim)
-
         self.to_queries = LinearNoBias(dim, dim_inner)
         self.to_key_values = LinearNoBias(dim, dim_kv_inner * 2) if not cross_attend_key_values else None
 
@@ -229,10 +227,9 @@ class Attention(Module):
         memories = None,
         offset = 0,
         return_memories = False,
-        is_decoder = True
+        sliding_window_size = None
     ):
-
-        tokens = self.norm(tokens)
+        sliding_window_size = default(sliding_window_size, self.sliding_window_size)
 
         q = self.to_queries(tokens)
 
@@ -267,8 +264,6 @@ class Attention(Module):
 
         rows, cols = q.shape[-2], k.shape[-2]
         single_token = rows == 1
-
-        sliding_window_size = self.sliding_window_size if is_decoder else None
 
         if self.use_flex_attn:
             out = flex_attention(
@@ -322,7 +317,6 @@ def Feedforward(
     dim_inner = int(dim * expansion_factor * 2 / 3)
 
     return Sequential(
-        RMSNorm(dim),
         Linear(dim, dim_inner * 2),
         GEGLU(),
         Linear(dim_inner, dim)
@@ -484,15 +478,18 @@ class Transformer(Module):
         layers = ModuleList([])
 
         for _ in range(depth):
+            self_attn_norm = RMSNorm(dim) if self_attn else None
             self_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, kv_heads = kv_heads, rotary_embed = self.rotary_embed, sliding_window_size = self.self_attn_window_size, use_flex_attn = use_flex_attn) if self_attn else None
 
+            cross_attn_norm = RMSNorm(dim) if cross_attn else None
             cross_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, kv_heads = cross_attn_kv_heads, cross_attend_key_values = True, use_flex_attn = use_flex_attn) if cross_attn else None
 
+            ff_norm = RMSNorm(dim)
             ff = Feedforward(dim = dim, expansion_factor = ff_expansion_factor)
 
             attn_res = AttentionResidual(dim, query_key_rank = attn_residual_query_key_rank) if attn_residual else None
 
-            layers.append(ModuleList([self_attn_module, cross_attn_module, ff, attn_res]))
+            layers.append(ModuleList([self_attn_norm, self_attn_module, cross_attn_norm, cross_attn_module, ff_norm, ff, attn_res]))
 
         self.layers = layers
 
@@ -503,8 +500,7 @@ class Transformer(Module):
         keys_values = None,
         memories = None,
         block_outputs: list[Tensor] | None = None,
-        return_hiddens = False,
-        is_decoder = True
+        return_hiddens = False
     ):
         seq_len = tokens.shape[-2]
 
@@ -531,25 +527,31 @@ class Transformer(Module):
 
         # layers
 
-        for self_attn, cross_attn, ff, attn_residual in self.layers:
+        for self_attn_norm, self_attn, cross_attn_norm, cross_attn, ff_norm, ff, attn_residual in self.layers:
 
             # self attention
 
             if exists(self_attn):
-                self_attn_out, next_memory = self_attn(tokens, memories = next(iter_memories, None), offset = step, return_memories = True, is_decoder = is_decoder)
+                self_attn_out, next_memory = self_attn(
+                    self_attn_norm(tokens),
+                    memories = next(iter_memories, None),
+                    offset = step,
+                    return_memories = True,
+                    sliding_window_size = self.self_attn_window_size
+                )
                 tokens = self_attn_out + tokens
 
                 next_memories.append(next_memory)
 
             # special cross attention from YOCO
 
-            if exists(cross_attn) and is_decoder:
+            if exists(cross_attn):
                 layer_keys_values = next(iter_keys_values, None)
-                tokens = cross_attn(tokens, keys_values = layer_keys_values) + tokens
+                tokens = cross_attn(cross_attn_norm(tokens), keys_values = layer_keys_values) + tokens
 
             # feedforward
 
-            tokens = ff(tokens) + tokens
+            tokens = ff(ff_norm(tokens)) + tokens
 
             # keep the hidden states for the attention residual
 
@@ -563,7 +565,7 @@ class Transformer(Module):
 
         # maybe take care of sliding window size - since always doing one token at a time, just do like inference where one slices off the earlier end
 
-        if exists(self.self_attn_window_size) and is_decoder:
+        if exists(self.self_attn_window_size):
             w = self.self_attn_window_size
             next_memories = tree_map_tensor(lambda t: t[..., -(w - 1):, :] if w > 1 else t[..., :0, :], next_memories)
 
@@ -632,6 +634,7 @@ class RLT(Module):
         attn_residual = False,
         attn_residual_query_key_rank: int | None = None,
         attn_residual_cross_encoder = False,
+        shared_weights = False,
         next_lat_loss = False,
         next_latent_loss_weight = 0.,
         next_latent_kl_loss_weight = 1.,
@@ -706,7 +709,13 @@ class RLT(Module):
             attn_residual_query_key_rank = attn_residual_query_key_rank
         )
 
-        self.shared_weights = enc_depth == dec_depth
+        assert not (shared_weights and enc_depth != dec_depth), f'enc_depth ({enc_depth}) must equal dec_depth ({dec_depth}) when sharing weights'
+
+        self.shared_weights = shared_weights
+
+        # encoder
+
+        self.encoder = Transformer(dim, depth = enc_depth, **transformer_kwargs)
 
         # YOCO - Sun et al.
 
@@ -739,7 +748,13 @@ class RLT(Module):
             **transformer_kwargs
         )
 
-        self.encoder = self.decoder if self.shared_weights else Transformer(dim, depth = enc_depth, **transformer_kwargs)
+        # maybe share weights between encoder and decoder
+        # stage-specific normalizations remain separate in each Transformer, while self_attn and ff are shared
+
+        if self.shared_weights:
+            for enc_layer, dec_layer in zip(self.encoder.layers, self.decoder.layers):
+                enc_layer[1] = dec_layer[1]
+                enc_layer[5] = dec_layer[5]
 
         # to logits
 
@@ -888,8 +903,7 @@ class RLT(Module):
             tokens,
             memories = enc_memories,
             return_memories = True,
-            return_hiddens = self.attn_residual_cross_encoder,
-            is_decoder = False
+            return_hiddens = self.attn_residual_cross_encoder
         )
 
         encoded, next_enc_memories = encoder_out.tokens, encoder_out.memories
@@ -938,8 +952,7 @@ class RLT(Module):
                 keys_values = step_keys_values,
                 memories = dec_memories,
                 return_memories = True,
-                block_outputs = [*step_encoder_hiddens, decoder_block] if self.attn_residual else None,
-                is_decoder = True
+                block_outputs = [*step_encoder_hiddens, decoder_block] if self.attn_residual else None
             )
 
             # append for output

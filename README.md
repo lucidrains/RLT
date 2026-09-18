@@ -6,6 +6,10 @@ Unofficial implementation of the [Recurrent Looped Transformer](https://yifanzha
 
 Will also do some exploration of the [Recurrent Transformer](https://arxiv.org/abs/2604.21215) proposed by Costin-Andrei Oncescu et al. of Harvard, if I have any remaining time
 
+## Appreciation
+
+- [Pranoy](https://github.com/pranoyr) for the PR on weight tying / sharing between encoder and decoder!
+
 ## Install
 
 ```bash
