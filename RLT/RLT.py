@@ -228,7 +228,8 @@ class Attention(Module):
         keys_values = None,
         memories = None,
         offset = 0,
-        return_memories = False
+        return_memories = False,
+        is_decoder = True
     ):
 
         tokens = self.norm(tokens)
@@ -267,11 +268,13 @@ class Attention(Module):
         rows, cols = q.shape[-2], k.shape[-2]
         single_token = rows == 1
 
+        sliding_window_size = self.sliding_window_size if is_decoder else None
+
         if self.use_flex_attn:
             out = flex_attention(
                 q, k, v,
                 causal = self.causal,
-                sliding_window_size = self.sliding_window_size,
+                sliding_window_size = sliding_window_size,
                 scale = self.scale
             )
         else:
@@ -284,8 +287,8 @@ class Attention(Module):
                 causal_mask = torch.ones((rows, cols), dtype = torch.bool, device = sim.device).triu(prefix_len + 1)
                 mask = causal_mask
 
-            if exists(self.sliding_window_size) and not single_token:
-                window_mask = torch.ones((rows, cols), dtype = torch.bool, device = sim.device).tril(prefix_len - self.sliding_window_size)
+            if exists(sliding_window_size) and not single_token:
+                window_mask = torch.ones((rows, cols), dtype = torch.bool, device = sim.device).tril(prefix_len - sliding_window_size)
                 mask = window_mask if mask is None else (mask | window_mask)
 
             if exists(mask):
@@ -500,7 +503,8 @@ class Transformer(Module):
         keys_values = None,
         memories = None,
         block_outputs: list[Tensor] | None = None,
-        return_hiddens = False
+        return_hiddens = False,
+        is_decoder = True
     ):
         seq_len = tokens.shape[-2]
 
@@ -532,14 +536,14 @@ class Transformer(Module):
             # self attention
 
             if exists(self_attn):
-                self_attn_out, next_memory = self_attn(tokens, memories = next(iter_memories, None), offset = step, return_memories = True)
+                self_attn_out, next_memory = self_attn(tokens, memories = next(iter_memories, None), offset = step, return_memories = True, is_decoder = is_decoder)
                 tokens = self_attn_out + tokens
 
                 next_memories.append(next_memory)
 
             # special cross attention from YOCO
 
-            if exists(cross_attn):
+            if exists(cross_attn) and is_decoder:
                 layer_keys_values = next(iter_keys_values, None)
                 tokens = cross_attn(tokens, keys_values = layer_keys_values) + tokens
 
@@ -559,7 +563,7 @@ class Transformer(Module):
 
         # maybe take care of sliding window size - since always doing one token at a time, just do like inference where one slices off the earlier end
 
-        if exists(self.self_attn_window_size):
+        if exists(self.self_attn_window_size) and is_decoder:
             w = self.self_attn_window_size
             next_memories = tree_map_tensor(lambda t: t[..., -(w - 1):, :] if w > 1 else t[..., :0, :], next_memories)
 
@@ -702,9 +706,7 @@ class RLT(Module):
             attn_residual_query_key_rank = attn_residual_query_key_rank
         )
 
-        # encoder
-
-        self.encoder = Transformer(dim, depth = enc_depth, **transformer_kwargs)
+        self.shared_weights = enc_depth == dec_depth
 
         # YOCO - Sun et al.
 
@@ -736,6 +738,8 @@ class RLT(Module):
             self_attn_window_size = dec_sliding_window_size,
             **transformer_kwargs
         )
+
+        self.encoder = self.decoder if self.shared_weights else Transformer(dim, depth = enc_depth, **transformer_kwargs)
 
         # to logits
 
@@ -884,7 +888,8 @@ class RLT(Module):
             tokens,
             memories = enc_memories,
             return_memories = True,
-            return_hiddens = self.attn_residual_cross_encoder
+            return_hiddens = self.attn_residual_cross_encoder,
+            is_decoder = False
         )
 
         encoded, next_enc_memories = encoder_out.tokens, encoder_out.memories
@@ -933,7 +938,8 @@ class RLT(Module):
                 keys_values = step_keys_values,
                 memories = dec_memories,
                 return_memories = True,
-                block_outputs = [*step_encoder_hiddens, decoder_block] if self.attn_residual else None
+                block_outputs = [*step_encoder_hiddens, decoder_block] if self.attn_residual else None,
+                is_decoder = True
             )
 
             # append for output
