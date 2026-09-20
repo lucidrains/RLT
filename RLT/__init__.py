@@ -7,5 +7,6 @@ from RLT.RLT import (
     AttentionResidual,
     NextLatentPrediction,
     Losses,
-    slice_recurrent_lengths
+    slice_recurrent_lengths,
+    RecurrentTransition
 )

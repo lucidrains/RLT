@@ -345,3 +345,20 @@ def test_shared_weights_equal_depth():
 
     with pytest.raises(AssertionError):
         RLT(dim = 64, enc_depth = 3, dec_depth = 2, shared_weights = True)
+
+def test_stack_trans_layer():
+    from stack_attention import StackTransLayer
+
+    model = RLT(
+        dim = 64,
+        enc_depth = 2,
+        dec_depth = 2,
+        num_tokens = 256,
+        recurrent_state_module = StackTransLayer(dim = 64)
+    )
+
+    tokens = torch.randint(0, 256, (2, 8))
+    loss = model(tokens, return_loss = True)
+    loss.backward()
+
+    assert exists(model.recurrent_state_module.to_action_logits.weight.grad)

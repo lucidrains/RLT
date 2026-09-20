@@ -26,7 +26,7 @@ from torch_einops_utils import masked_mean, maybe_return, pack_with_inverse, rep
 
 RLTMemories = namedtuple('RLTMemories', ['encoder_memories', 'decoder_memories'])
 EncoderMemories = namedtuple('EncoderMemories', ['memories', 'keys_values'])
-DecoderMemories = namedtuple('DecoderMemories', ['state', 'memories'])
+DecoderMemories = namedtuple('DecoderMemories', ['state', 'memories', 'recurrent_module_state'], defaults = (None,))
 TransformerMemories = namedtuple('TransformerMemories', ['step', 'memories'])
 Losses = namedtuple('Losses', ['cross_entropy', 'next_latent', 'kl_div'])
 
@@ -639,7 +639,8 @@ class RLT(Module):
         next_latent_loss_weight = 0.,
         next_latent_kl_loss_weight = 1.,
         next_latent_num_rollouts = 1,
-        next_latent_dynamics_depth = 3
+        next_latent_dynamics_depth = 3,
+        recurrent_state_module: Module | None = None
     ):
         super().__init__()
         has_num_tokens = exists(num_tokens)
@@ -736,6 +737,11 @@ class RLT(Module):
             recurrent_transition = RecurrentTransition(dim, alpha = recurrent_transition_alpha)
 
         self.combine_encoded_token_and_state = recurrent_transition
+
+        # recurrent state module along recurrent pathway
+
+        self.recurrent_state_module = recurrent_state_module
+        self.has_recurrent_state_module = exists(recurrent_state_module)
 
         # decoder
 
@@ -876,7 +882,12 @@ class RLT(Module):
 
         enc_memories, dec_memories = default(memories, (None, None))
         enc_memories, prev_keys_values = default(enc_memories, (None, None))
-        state, dec_memories = default(dec_memories, (None, None))
+
+        if exists(dec_memories):
+            state, dec_memories, *maybe_module_state = dec_memories
+            recurrent_module_state = maybe_module_state[0] if len(maybe_module_state) > 0 else None
+        else:
+            state, dec_memories, recurrent_module_state = None, None, None
 
         prev_num_tokens = prev_keys_values[0].shape[-2] if exists(prev_keys_values) else 0
 
@@ -966,16 +977,20 @@ class RLT(Module):
             if should_update_state:
                 state = decoder_output[:, -1:]
 
+                if self.has_recurrent_state_module:
+                    module_out = self.recurrent_state_module(state, recurrent_module_state)
+                    state, recurrent_module_state = module_out[:2] if isinstance(module_out, tuple) else (module_out, None)
+
             # truncated bptt
 
             if exists(self.tbptt_step_size) and divisible_by(total_index, self.tbptt_step_size):
-                state, dec_memories = tree_map_detach((state, dec_memories))
+                state, dec_memories, recurrent_module_state = tree_map_detach((state, dec_memories, recurrent_module_state))
 
         decoded = cat(decoder_outputs, dim = 1)
 
         memories = RLTMemories(
             EncoderMemories(next_enc_memories, (keys, values)),
-            DecoderMemories(state, dec_memories)
+            DecoderMemories(state, dec_memories, recurrent_module_state)
         )
 
         if not self.has_num_tokens:
