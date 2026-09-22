@@ -132,3 +132,15 @@ $ uv run train_enwik8.py
     url       = {https://arxiv.org/abs/2511.05963}
 }
 ```
+
+```bibtex
+@misc{wang2026fullbandwidthtransformer,
+    title         = {Full-bandwidth transformer},
+    author        = {Xi Wang and Ziyang Cai and Zheng Zhan and Harry Dong and Ying Fan and Gustavo de Rosa and Tim Pearce and John Langford},
+    year          = {2026},
+    eprint        = {2608.08888},
+    archivePrefix = {arXiv},
+    primaryClass  = {cs.LG},
+    url           = {https://arxiv.org/abs/2608.08888}
+}
+```

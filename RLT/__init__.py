@@ -8,5 +8,7 @@ from RLT.RLT import (
     NextLatentPrediction,
     Losses,
     slice_recurrent_lengths,
-    RecurrentTransition
+    RecurrentTransition,
+    GLUCrossTransition,
+    Scale
 )

@@ -1,6 +1,6 @@
 import pytest
 import torch
-from RLT import RLT, slice_recurrent_lengths
+from RLT import RLT, Scale, slice_recurrent_lengths
 
 param = pytest.mark.parametrize
 
@@ -11,6 +11,9 @@ def skip_if_flex_attn_unsupported(use_flex_attn):
     if use_flex_attn and not torch.cuda.is_available():
         pytest.skip('flex attention only supports backward on cuda')
 
+@param('tie_embedding', (False, True))
+@param('glu_cross', (False, True))
+@param('dec_depth_scale_residual', (False, True))
 @param('custom_recurrent_lengths', (False, True))
 @param('next_latent_prediction', (False, True))
 @param('attn_residual', (False, True))
@@ -28,6 +31,9 @@ def skip_if_flex_attn_unsupported(use_flex_attn):
     (None, 2)
 ))
 def test_rlt(
+    tie_embedding,
+    glu_cross,
+    dec_depth_scale_residual,
     custom_recurrent_lengths,
     next_latent_prediction,
     attn_residual,
@@ -52,8 +58,17 @@ def test_rlt(
         use_flex_attn = use_flex_attn,
         tbptt_step_size = 2,
         attn_residual = attn_residual,
-        next_lat_loss = next_latent_prediction
+        next_lat_loss = next_latent_prediction,
+        glu_cross = glu_cross,
+        dec_depth_scale_residual = dec_depth_scale_residual,
+        tie_embedding = tie_embedding
     )
+
+    if exists(num_tokens):
+        if tie_embedding:
+            assert model.to_logits[1].weight is model.token_emb.weight
+        else:
+            assert model.to_logits[1].weight is not model.token_emb.weight
 
     if exists(num_tokens):
         tokens = torch.randint(0, num_tokens, (2, seq_len))
@@ -327,6 +342,9 @@ def test_shared_weights_equal_depth():
     for enc_layer, dec_layer in zip(model.encoder.layers, model.decoder.layers):
         enc_self_attn_norm, enc_self_attn, _, _, enc_ff_norm, enc_ff, _ = enc_layer
         dec_self_attn_norm, dec_self_attn, _, _, dec_ff_norm, dec_ff, _ = dec_layer
+
+        dec_self_attn = dec_self_attn.fn if isinstance(dec_self_attn, Scale) else dec_self_attn
+        dec_ff = dec_ff.fn if isinstance(dec_ff, Scale) else dec_ff
 
         assert dec_self_attn.to_queries.weight.grad is not None
         assert dec_ff[0].weight.grad is not None

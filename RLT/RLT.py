@@ -20,7 +20,16 @@ from rotary_embedding_torch import RotaryEmbedding
 
 from x_mlps_pytorch import MLP
 
-from torch_einops_utils import masked_mean, maybe_return, pack_with_inverse, repeat_interleave_to_match, temp_eval, tree_map_detach, tree_map_tensor
+from torch_einops_utils import (
+    masked_mean,
+    maybe_return,
+    pack_with_inverse,
+    repeat_interleave_to_match,
+    temp_eval,
+    tree_flatten_with_inverse,
+    tree_map_detach,
+    tree_map_tensor
+)
 
 # types
 
@@ -148,6 +157,25 @@ def flex_attention(
         block_mask = create_block_mask(mask_mod, B = None, H = None, Q_LEN = rows, KV_LEN = cols, device = q.device)
 
     return pt_flex_attention(q, k, v, block_mask = block_mask, scale = scale)
+
+# helper modules
+
+class Scale(Module):
+    def __init__(self, scale, fn: Module | None = None):
+        super().__init__()
+        self.scale = scale
+        self.fn = default(fn, nn.Identity())
+
+    def forward(self, *args, **kwargs):
+        out = self.fn(*args, **kwargs)
+
+        if not exists(self.scale) or self.scale == 1.:
+            return out
+
+        tensors, inverse = tree_flatten_with_inverse(out)
+        first, *rest = tensors
+
+        return inverse([first * self.scale, *rest])
 
 # lora linear
 
@@ -461,7 +489,8 @@ class Transformer(Module):
         dim_rotary = None,
         use_flex_attn = False,
         attn_residual = False,
-        attn_residual_query_key_rank: int | None = None
+        attn_residual_query_key_rank: int | None = None,
+        scale_residual = False
     ):
         super().__init__()
         assert not exists(self_attn_window_size) or self_attn_window_size >= 1
@@ -469,6 +498,21 @@ class Transformer(Module):
 
         self.self_attn_window_size = self_attn_window_size
         self.has_attn_residual = attn_residual
+
+        # depth scaling for residuals (Yang et al. / Noci et al.)
+
+        residual_scale = None
+
+        if attn_residual:
+            residual_scale = 1.
+        elif isinstance(scale_residual, bool):
+            residual_scale = (depth ** -0.5) if scale_residual else None
+        elif isinstance(scale_residual, (int, float)):
+            residual_scale = float(scale_residual)
+
+        self.residual_scale = residual_scale
+
+        maybe_scale_output = (lambda m: Scale(residual_scale, m) if exists(m) else None) if (exists(residual_scale) and residual_scale != 1.) else identity
 
         # rotary embedding
 
@@ -489,7 +533,15 @@ class Transformer(Module):
 
             attn_res = AttentionResidual(dim, query_key_rank = attn_residual_query_key_rank) if attn_residual else None
 
-            layers.append(ModuleList([self_attn_norm, self_attn_module, cross_attn_norm, cross_attn_module, ff_norm, ff, attn_res]))
+            layers.append(ModuleList([
+                self_attn_norm,
+                maybe_scale_output(self_attn_module),
+                cross_attn_norm,
+                maybe_scale_output(cross_attn_module),
+                ff_norm,
+                maybe_scale_output(ff),
+                attn_res
+            ]))
 
         self.layers = layers
 
@@ -539,6 +591,7 @@ class Transformer(Module):
                     return_memories = True,
                     sliding_window_size = self.self_attn_window_size
                 )
+
                 tokens = self_attn_out + tokens
 
                 next_memories.append(next_memory)
@@ -606,6 +659,25 @@ class RecurrentTransition(Module):
 
         return encoded + α * gates * state_out
 
+# GLU Cross transition from Full-bandwidth Transformer (Xi Wang et al. https://arxiv.org/abs/2608.08888)
+
+class GLUCrossTransition(Module):
+    def __init__(
+        self,
+        dim
+    ):
+        super().__init__()
+        self.to_state = LinearNoBias(dim, dim)
+        self.to_gate = LinearNoBias(dim, dim)
+
+    def forward(
+        self,
+        state,
+        encoded
+    ):
+        encoded, state = torch.broadcast_tensors(encoded, state)
+        return self.to_state(state) * self.to_gate(encoded).sigmoid()
+
 # main class
 
 class RLT(Module):
@@ -629,6 +701,7 @@ class RLT(Module):
         rotary_embed = True,
         dim_rotary = None,
         recurrent_transition: Module | None = None,
+        glu_cross = False,
         use_flex_attn = False,
         tbptt_step_size: int | None = None,
         attn_residual = False,
@@ -640,11 +713,15 @@ class RLT(Module):
         next_latent_kl_loss_weight = 1.,
         next_latent_num_rollouts = 1,
         next_latent_dynamics_depth = 3,
-        recurrent_state_module: Module | None = None
+        recurrent_state_module: Module | None = None,
+        enc_depth_scale_residual = False,
+        dec_depth_scale_residual = True,
+        tie_embedding = True
     ):
         super().__init__()
         has_num_tokens = exists(num_tokens)
         self.has_num_tokens = has_num_tokens
+        self.tie_embedding = tie_embedding
         self.recurrent_block_size = to_tuple(recurrent_block_size)
 
         self.token_emb = nn.Embedding(num_tokens, dim) if has_num_tokens else None
@@ -716,7 +793,12 @@ class RLT(Module):
 
         # encoder
 
-        self.encoder = Transformer(dim, depth = enc_depth, **transformer_kwargs)
+        self.encoder = Transformer(
+            dim,
+            depth = enc_depth,
+            scale_residual = enc_depth_scale_residual,
+            **transformer_kwargs
+        )
 
         # YOCO - Sun et al.
 
@@ -734,9 +816,17 @@ class RLT(Module):
         self.initial_state = nn.Parameter(torch.randn(dim) * 1e-2)
 
         if not exists(recurrent_transition):
-            recurrent_transition = RecurrentTransition(dim, alpha = recurrent_transition_alpha)
+            if glu_cross:
+                recurrent_transition = GLUCrossTransition(dim)
+            else:
+                recurrent_transition = RecurrentTransition(dim, alpha = recurrent_transition_alpha)
 
         self.combine_encoded_token_and_state = recurrent_transition
+
+        # norm the fused input from recurrence before feeding into the network (Xi Wang et al. - Full-bandwidth transformer)
+
+        self.fused_norm = RMSNorm(dim)
+        self.fused_input_norm = self.fused_norm
 
         # recurrent state module along recurrent pathway
 
@@ -751,6 +841,7 @@ class RLT(Module):
             cross_attn = True,
             cross_attn_kv_heads = cross_attn_kv_heads,
             self_attn_window_size = dec_sliding_window_size,
+            scale_residual = dec_depth_scale_residual,
             **transformer_kwargs
         )
 
@@ -764,9 +855,15 @@ class RLT(Module):
 
         # to logits
 
+        to_logits_linear = LinearNoBias(dim, num_tokens) if has_num_tokens else None
+
+        if has_num_tokens and tie_embedding:
+            to_logits_linear.weight = self.token_emb.weight
+
         self.to_logits = Sequential(
             RMSNorm(dim),
-            LinearNoBias(dim, num_tokens)
+            to_logits_linear,
+            Scale(dim ** -0.5) if tie_embedding else nn.Identity()
         ) if has_num_tokens else None
 
     @property
@@ -948,6 +1045,7 @@ class RLT(Module):
             # combine encoded block with state (relies on broadcasting)
 
             decoder_block = self.combine_encoded_token_and_state(state, encoded_block)
+            decoder_block = self.fused_norm(decoder_block)
 
             # slice the encoded key / values to the current sequence position, and map each decoder layer to its encoded layer
 
