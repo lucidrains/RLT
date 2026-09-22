@@ -335,8 +335,8 @@ class AttentionResidual(Module):
         super().__init__()
         self.scale = dim ** -0.5
 
-        self.to_queries = LoRALinear(dim, rank = query_key_rank)
-        self.to_keys = LoRALinear(dim, rank = query_key_rank)
+        self.to_queries = Sequential(RMSNorm(dim), LoRALinear(dim, rank = query_key_rank))
+        self.to_keys = Sequential(RMSNorm(dim), LoRALinear(dim, rank = query_key_rank))
 
         self.query_rmsnorm = RMSNorm(dim)
         self.key_rmsnorm = RMSNorm(dim)
