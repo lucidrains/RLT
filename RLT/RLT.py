@@ -22,6 +22,7 @@ from x_mlps_pytorch import MLP
 
 from torch_einops_utils import (
     masked_mean,
+    maybe,
     maybe_return,
     pack_with_inverse,
     repeat_interleave_to_match,
@@ -56,6 +57,9 @@ def identity(t, *args, **kwargs):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+def uniform_like(t, low = -1., high = 1.):
+    return torch.empty_like(t).uniform_(low, high)
 
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
@@ -512,7 +516,7 @@ class Transformer(Module):
 
         self.residual_scale = residual_scale
 
-        maybe_scale_output = (lambda m: Scale(residual_scale, m) if exists(m) else None) if (exists(residual_scale) and residual_scale != 1.) else identity
+        maybe_scale_output = maybe(partial(Scale, residual_scale)) if (exists(residual_scale) and residual_scale != 1.) else identity
 
         # rotary embedding
 
@@ -716,7 +720,8 @@ class RLT(Module):
         recurrent_state_module: Module | None = None,
         enc_depth_scale_residual = False,
         dec_depth_scale_residual = True,
-        tie_embedding = True
+        tie_embedding = True,
+        jitter_noise_delta = 0.
     ):
         super().__init__()
         has_num_tokens = exists(num_tokens)
@@ -827,6 +832,9 @@ class RLT(Module):
 
         self.fused_norm = RMSNorm(dim)
         self.fused_input_norm = self.fused_norm
+
+        self.jitter_noise_delta = jitter_noise_delta
+        self.has_jitter_noise_delta = jitter_noise_delta > 0.
 
         # recurrent state module along recurrent pathway
 
@@ -961,7 +969,8 @@ class RLT(Module):
         return_loss = False,
         return_loss_breakdown = False,
         recurrent_lengths: int | Sequence[int] | None = None,
-        update_state: bool | None = None
+        update_state: bool | None = None,
+        jitter_noise_delta: float | None = None
     ):
         # embed
 
@@ -987,6 +996,9 @@ class RLT(Module):
             state, dec_memories, recurrent_module_state = None, None, None
 
         prev_num_tokens = prev_keys_values[0].shape[-2] if exists(prev_keys_values) else 0
+
+        has_jitter_noise_delta = (jitter_noise_delta > 0.) if exists(jitter_noise_delta) else self.has_jitter_noise_delta
+        jitter_noise_delta = default(jitter_noise_delta, self.jitter_noise_delta)
 
         # recurrent lengths
 
@@ -1041,6 +1053,11 @@ class RLT(Module):
 
             curr += block_len
             total_index = prev_num_tokens + curr
+
+            # maybe jitter noise along recurrent state (Xi Wang et al. - Full-bandwidth transformer)
+
+            if self.training and has_jitter_noise_delta:
+                state = state + uniform_like(state, -jitter_noise_delta, jitter_noise_delta)
 
             # combine encoded block with state (relies on broadcasting)
 

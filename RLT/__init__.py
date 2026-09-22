@@ -10,5 +10,6 @@ from RLT.RLT import (
     slice_recurrent_lengths,
     RecurrentTransition,
     GLUCrossTransition,
-    Scale
+    Scale,
+    uniform_like
 )

@@ -11,6 +11,7 @@ def skip_if_flex_attn_unsupported(use_flex_attn):
     if use_flex_attn and not torch.cuda.is_available():
         pytest.skip('flex attention only supports backward on cuda')
 
+@param('jitter_noise_delta', (0., 0.02))
 @param('tie_embedding', (False, True))
 @param('glu_cross', (False, True))
 @param('dec_depth_scale_residual', (False, True))
@@ -31,6 +32,7 @@ def skip_if_flex_attn_unsupported(use_flex_attn):
     (None, 2)
 ))
 def test_rlt(
+    jitter_noise_delta,
     tie_embedding,
     glu_cross,
     dec_depth_scale_residual,
@@ -61,8 +63,11 @@ def test_rlt(
         next_lat_loss = next_latent_prediction,
         glu_cross = glu_cross,
         dec_depth_scale_residual = dec_depth_scale_residual,
-        tie_embedding = tie_embedding
+        tie_embedding = tie_embedding,
+        jitter_noise_delta = jitter_noise_delta
     )
+
+    assert model.has_jitter_noise_delta == (jitter_noise_delta > 0.)
 
     if exists(num_tokens):
         if tie_embedding:
