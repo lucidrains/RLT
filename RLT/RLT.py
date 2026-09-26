@@ -181,6 +181,12 @@ class Scale(Module):
 
         return inverse([first * self.scale, *rest])
 
+def init_depth_scaled_(projection, layer_depth):
+    # depth scaling of the residual branch output projection, as in the olmo 'mitchell' init
+    # std = 1 / sqrt(2 * fan_in * layer_depth)
+
+    nn.init.normal_(projection.weight, std = (2 * projection.in_features * layer_depth) ** -0.5)
+
 # lora linear
 
 class LoRALinear(Module):
@@ -224,7 +230,8 @@ class Attention(Module):
         cross_attend_key_values = False,
         rotary_embed: RotaryEmbedding | None = None,
         sliding_window_size: int | None = None,
-        use_flex_attn = False
+        use_flex_attn = False,
+        output_proj_depth: int | None = None
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -244,6 +251,9 @@ class Attention(Module):
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
         self.to_out = LinearNoBias(dim_inner, dim)
+
+        if exists(output_proj_depth):
+            init_depth_scaled_(self.to_out, output_proj_depth)
 
         self.rotary_embed = rotary_embed
         self.sliding_window_size = sliding_window_size
@@ -344,14 +354,20 @@ class GEGLU(Module):
 
 def Feedforward(
     dim,
-    expansion_factor = 4.
+    expansion_factor = 4.,
+    output_proj_depth: int | None = None
 ):
     dim_inner = int(dim * expansion_factor * 2 / 3)
+
+    to_out = Linear(dim_inner, dim)
+
+    if exists(output_proj_depth):
+        init_depth_scaled_(to_out, output_proj_depth)
 
     return Sequential(
         Linear(dim, dim_inner * 2),
         GEGLU(),
-        Linear(dim_inner, dim)
+        to_out
     )
 
 # attention residual
@@ -504,16 +520,19 @@ class Transformer(Module):
         self.has_attn_residual = attn_residual
 
         # depth scaling for residuals (Yang et al. / Noci et al.)
+        # boolean `scale_residual` scales the residual branch output projections at init (as in the olmo 'mitchell' init)
+        # while a float argument scales the branch output at runtime
+
+        depth_scale_residual = isinstance(scale_residual, bool) and scale_residual
 
         residual_scale = None
 
         if attn_residual:
             residual_scale = 1.
-        elif isinstance(scale_residual, bool):
-            residual_scale = (depth ** -0.5) if scale_residual else None
-        elif isinstance(scale_residual, (int, float)):
+        elif isinstance(scale_residual, (int, float)) and not isinstance(scale_residual, bool):
             residual_scale = float(scale_residual)
 
+        self.depth_scale_residual = depth_scale_residual
         self.residual_scale = residual_scale
 
         maybe_scale_output = maybe(partial(Scale, residual_scale)) if (exists(residual_scale) and residual_scale != 1.) else identity
@@ -525,15 +544,17 @@ class Transformer(Module):
 
         layers = ModuleList([])
 
-        for _ in range(depth):
+        for layer_index in range(depth):
+            output_proj_depth = (layer_index + 1) if depth_scale_residual else None
+
             self_attn_norm = RMSNorm(dim) if self_attn else None
-            self_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, kv_heads = kv_heads, rotary_embed = self.rotary_embed, sliding_window_size = self.self_attn_window_size, use_flex_attn = use_flex_attn) if self_attn else None
+            self_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, kv_heads = kv_heads, rotary_embed = self.rotary_embed, sliding_window_size = self.self_attn_window_size, use_flex_attn = use_flex_attn, output_proj_depth = output_proj_depth) if self_attn else None
 
             cross_attn_norm = RMSNorm(dim) if cross_attn else None
-            cross_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, kv_heads = cross_attn_kv_heads, cross_attend_key_values = True, use_flex_attn = use_flex_attn) if cross_attn else None
+            cross_attn_module = Attention(dim = dim, dim_head = dim_head, heads = heads, kv_heads = cross_attn_kv_heads, cross_attend_key_values = True, use_flex_attn = use_flex_attn, output_proj_depth = output_proj_depth) if cross_attn else None
 
             ff_norm = RMSNorm(dim)
-            ff = Feedforward(dim = dim, expansion_factor = ff_expansion_factor)
+            ff = Feedforward(dim = dim, expansion_factor = ff_expansion_factor, output_proj_depth = output_proj_depth)
 
             attn_res = AttentionResidual(dim, query_key_rank = attn_residual_query_key_rank) if attn_residual else None
 
